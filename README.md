@@ -33,10 +33,10 @@ C:\Program Files (x86)\WinFsp
 Open **Developer PowerShell for VS 2022** and run:
 
 ```powershell
-msbuild VaultFsPhase1.sln /p:Configuration=Release /p:Platform=x64
+msbuild VaultFs.sln /p:Configuration=Release /p:Platform=x64
 ```
 
-Or open `VaultFsPhase1.sln` in Visual Studio and build `Release|x64`.
+Or open `VaultFs.sln` in Visual Studio and build `Release|x64`.
 
 ## Run
 
@@ -50,7 +50,7 @@ Mount it as a drive:
 
 ```powershell
 $env:VAULTFS_KEY = "change this development key"
-.\x64\Release\VaultFsPhase1.exe D:\vault_backing X:
+.\x64\Release\VaultFs.exe D:\vault_backing X:
 ```
 
 Now `X:` should show the contents of `D:\vault_backing`.
@@ -68,7 +68,7 @@ The script creates a temporary file on the mounted filesystem, verifies create/r
 Unmount:
 
 ```powershell
-taskkill /im VaultFsPhase1.exe /f
+taskkill /im VaultFs.exe /f
 ```
 
 or press Ctrl+C in the console.

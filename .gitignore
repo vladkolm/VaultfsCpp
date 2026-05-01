@@ -7,9 +7,9 @@
 x64/
 Debug/
 Release/
-VaultFsPhase1/x64/
-VaultFsPhase1/Debug/
-VaultFsPhase1/Release/
+VaultFs/x64/
+VaultFs/Debug/
+VaultFs/Release/
 *.obj
 *.pdb
 *.ilk

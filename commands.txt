@@ -1,7 +1,7 @@
-msbuild VaultFsPhase1.sln /p:Configuration=Release /p:Platform=x64
+msbuild VaultFs.sln /p:Configuration=Release /p:Platform=x64
 
 
-VaultFsPhase1.exe e:\prj\cpp\vaultfs_phase1_cpp\x64\Release\z x:
+VaultFs.exe e:\prj\cpp\VaultfsCpp\x64\Release\z x:
 
 
 echo hello > x:\a.txt
@@ -17,4 +17,3 @@ echo hello > x:\a.txt
 mkdir x:\d
 move x:\a.txt x:\d\b.txt
 type x:\d\b.txt
-
