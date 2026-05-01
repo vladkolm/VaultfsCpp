@@ -1,0 +1,27 @@
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Visual Studio / MSBuild outputs
+x64/
+Debug/
+Release/
+VaultFsPhase1/x64/
+VaultFsPhase1/Debug/
+VaultFsPhase1/Release/
+*.obj
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+*.tlog
+*.log
+
+# Local vault/backing data
+tmp/
+*.zip
+
+# OS/editor noise
+Thumbs.db
+Desktop.ini

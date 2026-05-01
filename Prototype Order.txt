@@ -1,0 +1,14 @@
+Minimum viable prototype order
+
+I would build it in this exact order:
+
+1. Plain passthrough WinFsp filesystem
+2. Short-ID object storage, no encryption
+3. Directory maps, plaintext JSON
+4. Create/read/write/list/delete/rename
+5. Atomic map writing
+6. Recovery checker
+7. Encrypt file contents
+8. Encrypt directory maps
+9. Encrypt metadata
+10. Stress tests with long names and deep paths
