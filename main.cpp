@@ -797,6 +797,23 @@ struct VaultContext
 };
 
 static VaultContext* g_Vault = nullptr;
+static HANDLE g_StopEvent = nullptr;
+
+static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType)
+{
+    switch (ctrlType)
+    {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        if (g_StopEvent)
+            SetEvent(g_StopEvent);
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
 
 static void FillFileInfoFromAttributes(const WIN32_FILE_ATTRIBUTE_DATA& data, const std::wstring& id, ObjectType type, FSP_FSCTL_FILE_INFO* info)
 {
@@ -1565,6 +1582,20 @@ int wmain(int argc, wchar_t** argv)
     vault.Resolver = std::make_unique<PathResolver>(*vault.Store);
     g_Vault = &vault;
 
+    g_StopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_StopEvent)
+    {
+        fwprintf(stderr, L"CreateEvent failed: %lu\n", GetLastError());
+        return 1;
+    }
+    if (!SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE))
+    {
+        fwprintf(stderr, L"SetConsoleCtrlHandler failed: %lu\n", GetLastError());
+        CloseHandle(g_StopEvent);
+        g_StopEvent = nullptr;
+        return 1;
+    }
+
     DirectoryMap root;
     DirectoryMap::Load(*vault.Store, RootId, root);
 
@@ -1603,6 +1634,9 @@ int wmain(int argc, wchar_t** argv)
     if (!NT_SUCCESS(status))
     {
         fwprintf(stderr, L"FspFileSystemCreate failed: 0x%08X\n", status);
+        SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+        CloseHandle(g_StopEvent);
+        g_StopEvent = nullptr;
         return 1;
     }
 
@@ -1612,6 +1646,9 @@ int wmain(int argc, wchar_t** argv)
     {
         fwprintf(stderr, L"FspFileSystemSetMountPoint failed: 0x%08X\n", status);
         FspFileSystemDelete(vault.FileSystem);
+        SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+        CloseHandle(g_StopEvent);
+        g_StopEvent = nullptr;
         return 1;
     }
 
@@ -1620,13 +1657,19 @@ int wmain(int argc, wchar_t** argv)
     {
         fwprintf(stderr, L"FspFileSystemStartDispatcher failed: 0x%08X\n", status);
         FspFileSystemDelete(vault.FileSystem);
+        SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+        CloseHandle(g_StopEvent);
+        g_StopEvent = nullptr;
         return 1;
     }
 
-    wprintf(L"Mounted %s at %s using short object IDs. Press Enter to stop.\n", vault.BackingRoot.c_str(), argv[2]);
-    getchar();
+    wprintf(L"Mounted %s at %s using short object IDs. Press Ctrl-C to stop.\n", vault.BackingRoot.c_str(), argv[2]);
+    WaitForSingleObject(g_StopEvent, INFINITE);
 
     FspFileSystemStopDispatcher(vault.FileSystem);
     FspFileSystemDelete(vault.FileSystem);
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+    CloseHandle(g_StopEvent);
+    g_StopEvent = nullptr;
     return 0;
 }
