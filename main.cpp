@@ -153,6 +153,26 @@ static std::vector<std::wstring> SplitLogicalPath(const std::wstring& path)
     return parts;
 }
 
+static std::wstring ParentLogicalPath(const std::wstring& path)
+{
+    std::vector<std::wstring> parts = SplitLogicalPath(path);
+    if (parts.size() <= 1)
+        return L"";
+
+    std::wstring parent;
+    for (size_t i = 0; i + 1 < parts.size(); ++i)
+    {
+        parent += L"\\";
+        parent += parts[i];
+    }
+    return parent;
+}
+
+static bool IsName(const wchar_t* value, const wchar_t* expected)
+{
+    return value && expected && 0 == wcscmp(value, expected);
+}
+
 static bool WildcardMatch(const wchar_t* pattern, const wchar_t* text)
 {
     if (pattern == nullptr || pattern[0] == L'\0')
@@ -1633,6 +1653,34 @@ static NTSTATUS ApiReadDirectory(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR Pat
         return !!FspFileSystemAddDirInfo(dirInfo, Buffer, Length, &bytes);
     };
 
+    if (dir.Id != RootId)
+    {
+        ResolvedPath parent;
+        status = g_Vault->Resolver->ResolvePath(ParentLogicalPath(ctx->LogicalPath), parent);
+        if (!NT_SUCCESS(status))
+            return status;
+        if (!parent.Exists || parent.Type != ObjectType::Directory)
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+
+        if (!Marker)
+        {
+            if (!addDirEntry(L".", dir))
+            {
+                *PBytesTransferred = bytes;
+                return STATUS_SUCCESS;
+            }
+        }
+        if (!Marker || IsName(Marker, L"."))
+        {
+            if (!addDirEntry(L"..", parent))
+            {
+                *PBytesTransferred = bytes;
+                return STATUS_SUCCESS;
+            }
+            Marker = nullptr;
+        }
+    }
+
     for (std::map<std::wstring, MapEntry>::const_iterator it = map.Entries.begin(); it != map.Entries.end(); ++it)
     {
         const std::wstring& name = it->first;
@@ -1644,7 +1692,10 @@ static NTSTATUS ApiReadDirectory(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR Pat
 
         ResolvedPath child{ true, entry.Id, entry.Type, dir.Id, name, entry };
         if (!addDirEntry(name, child))
-            break;
+        {
+            *PBytesTransferred = bytes;
+            return STATUS_SUCCESS;
+        }
     }
 
     FspFileSystemAddDirInfo(nullptr, Buffer, Length, &bytes);
@@ -1659,6 +1710,26 @@ static NTSTATUS ApiGetDirInfoByName(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR 
         return STATUS_NOT_A_DIRECTORY;
 
     std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
+
+    ResolvedPath child;
+    if (IsName(FileName, L".") || IsName(FileName, L".."))
+    {
+        std::wstring logicalPath = IsName(FileName, L"..") ? ParentLogicalPath(ctx->LogicalPath) : ctx->LogicalPath;
+        NTSTATUS status = g_Vault->Resolver->ResolvePath(logicalPath, child);
+        if (!NT_SUCCESS(status))
+            return status;
+        if (!child.Exists || child.Type != ObjectType::Directory)
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+
+        memset(DirInfo, 0, sizeof(*DirInfo));
+        DirInfo->Size = static_cast<UINT16>(DirInfoSizeForName(FileName));
+        status = GetObjectInfo(child, &DirInfo->FileInfo);
+        if (!NT_SUCCESS(status))
+            return status;
+        CopyDirInfoName(DirInfo, FileName);
+        return STATUS_SUCCESS;
+    }
+
     std::wstring childPath;
     if (FileName && (FileName[0] == L'\\' || FileName[0] == L'/'))
     {
@@ -1676,7 +1747,6 @@ static NTSTATUS ApiGetDirInfoByName(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR 
         childPath += FileName ? FileName : L"";
     }
 
-    ResolvedPath child;
     NTSTATUS status = g_Vault->Resolver->ResolvePath(childPath, child);
     if (!NT_SUCCESS(status))
         return status;
@@ -1684,7 +1754,7 @@ static NTSTATUS ApiGetDirInfoByName(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR 
         return STATUS_OBJECT_NAME_NOT_FOUND;
 
     memset(DirInfo, 0, sizeof(*DirInfo));
-    DirInfo->Size = static_cast<UINT16>(FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) + wcslen(FileName) * sizeof(WCHAR));
+    DirInfo->Size = static_cast<UINT16>(DirInfoSizeForName(FileName ? FileName : L""));
     status = GetObjectInfo(child, &DirInfo->FileInfo);
     if (!NT_SUCCESS(status))
         return status;
