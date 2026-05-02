@@ -6,8 +6,8 @@ It implements a Phase 2 prototype content-encryption layer. Logical directory en
 
 ```text
 Mounted view: X:\file.txt
-Maps:         D:\vault_backing\.maps\root.map
-Object data:  D:\vault_backing\.objects\ab\cd\abcdef1234567890.data
+Maps:         D:\vault_backing\.maps\<keyed-label>.map
+Object data:  D:\vault_backing\.objects\ab\cd\<keyed-label>.data
 ```
 
 ## Requirements
@@ -75,15 +75,19 @@ or press Ctrl+C in the console.
 
 ## Current storage layout
 
-- `.maps\<directory-id>.map` stores encrypted logical child-name metadata.
-- `.objects\<id[0..1]>\<id[2..3]>\<id>.data` stores encrypted file contents.
-- The root directory has the fixed ID `root`.
+- `.maps\<keyed-label>.map` stores encrypted logical child-name metadata.
+- `.objects\<label[0..1]>\<label[2..3]>\<keyed-label>.data` stores encrypted file contents.
+- Internal object IDs, logical file sizes, logical timestamps, and logical attributes are stored only inside encrypted maps.
+- Physical map and object filenames use SHA-256 based labels derived from `VAULTFS_KEY`.
+- Physical object files are rounded to 4096-byte size buckets; the mounted filesystem reports the encrypted logical size from the map.
 
 ## Encryption
 
 Set `VAULTFS_KEY` before mounting. The prototype derives a SHA-256 key from this value and uses a SHA-256 based random-access keystream per object ID and byte offset.
 
-This protects file object contents in `.objects` and directory metadata contents in `.maps` from appearing as plaintext. Existing plaintext map files can still be read and are rewritten encrypted when modified. Physical map filenames, object IDs, file sizes, and directory shape are still visible, and file/map contents are not authenticated yet.
+This protects file object contents in `.objects`, directory metadata contents in `.maps`, logical names, entry IDs, entry types, logical size/timestamp/attribute metadata, and physical map/object filenames from appearing as plaintext. Existing plaintext map files can still be read and are rewritten encrypted under keyed names when modified.
+
+The current file-per-object design still leaks metadata that NTFS itself observes: object count, 4096-byte physical size buckets, backing-file timestamps, and access patterns. Hiding those further requires stronger padding, timestamp normalization, batched writes, or a container format. File/map contents are also not authenticated yet.
 
 ## Current operations
 
@@ -103,4 +107,4 @@ Implemented via WinFsp passthrough callbacks:
 
 ## Next phase
 
-The next phase should add metadata protection, authenticated encryption, and key management.
+The next phase should add authenticated encryption, size/timestamp padding, and key management.

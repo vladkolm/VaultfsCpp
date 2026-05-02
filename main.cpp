@@ -34,6 +34,12 @@ struct MapEntry
 {
     std::wstring Id;
     ObjectType Type = ObjectType::File;
+    UINT64 FileSize = 0;
+    UINT64 CreationTime = 0;
+    UINT64 LastAccessTime = 0;
+    UINT64 LastWriteTime = 0;
+    UINT64 ChangeTime = 0;
+    UINT32 FileAttributes = FILE_ATTRIBUTE_NORMAL;
 };
 
 struct ResolvedPath
@@ -43,10 +49,12 @@ struct ResolvedPath
     ObjectType Type = ObjectType::Directory;
     std::wstring ParentId;
     std::wstring Name;
+    MapEntry Entry;
 };
 
 static constexpr wchar_t RootId[] = L"root";
 static wchar_t DiskDeviceName[] = L"WinFsp.Disk";
+static constexpr UINT64 PhysicalSizeQuantum = 4096;
 
 static NTSTATUS Win32ToNtStatus(DWORD error)
 {
@@ -167,6 +175,18 @@ static UINT64 FileTimeToUInt64(const FILETIME& ft)
     return u.QuadPart;
 }
 
+static UINT64 CurrentFileTimeUInt64()
+{
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    return FileTimeToUInt64(ft);
+}
+
+static UINT64 RoundUp(UINT64 value, UINT64 quantum)
+{
+    return value == 0 ? 0 : ((value + quantum - 1) / quantum) * quantum;
+}
+
 static NTSTATUS BCryptToNtStatus(NTSTATUS status)
 {
     return status;
@@ -206,6 +226,19 @@ static NTSTATUS Sha256(const BYTE* data, ULONG dataSize, std::array<BYTE, 32>& d
 static NTSTATUS Sha256(const std::vector<BYTE>& data, std::array<BYTE, 32>& digest)
 {
     return Sha256(data.data(), static_cast<ULONG>(data.size()), digest);
+}
+
+static std::wstring HexFromBytes(const BYTE* data, size_t size)
+{
+    static constexpr wchar_t Hex[] = L"0123456789abcdef";
+    std::wstring out;
+    out.reserve(size * 2);
+    for (size_t i = 0; i < size; ++i)
+    {
+        out.push_back(Hex[(data[i] >> 4) & 0x0f]);
+        out.push_back(Hex[data[i] & 0x0f]);
+    }
+    return out;
 }
 
 static NTSTATUS DeriveMasterKey(const std::wstring& passphrase, std::array<BYTE, 32>& key)
@@ -268,6 +301,27 @@ static std::wstring MapCipherId(const std::wstring& dirId)
     return L"map:" + dirId;
 }
 
+static std::wstring DeriveStorageLabel(const std::wstring& purpose, const std::wstring& id)
+{
+    if (!g_MasterKeyReady)
+        return id;
+
+    std::string purposeUtf8 = WideToUtf8(purpose);
+    std::string idUtf8 = WideToUtf8(id);
+    std::vector<BYTE> material;
+    const char prefix[] = "VaultFS metadata name v1";
+    material.insert(material.end(), prefix, prefix + sizeof(prefix) - 1);
+    material.insert(material.end(), g_MasterKey.begin(), g_MasterKey.end());
+    material.insert(material.end(), purposeUtf8.begin(), purposeUtf8.end());
+    material.push_back(0);
+    material.insert(material.end(), idUtf8.begin(), idUtf8.end());
+
+    std::array<BYTE, 32> digest{};
+    if (!NT_SUCCESS(Sha256(material, digest)))
+        return id;
+    return HexFromBytes(digest.data(), digest.size());
+}
+
 class ObjectStore
 {
 public:
@@ -295,6 +349,18 @@ public:
 
     std::wstring DataPath(const std::wstring& id) const
     {
+        std::wstring label = ObjectLabel(id);
+        std::wstring path = ObjectsRoot() + L"\\" + label.substr(0, 2);
+        path += L"\\";
+        path += label.substr(2, 2);
+        path += L"\\";
+        path += label;
+        path += L".data";
+        return path;
+    }
+
+    std::wstring LegacyDataPath(const std::wstring& id) const
+    {
         std::wstring path = ObjectsRoot() + L"\\" + id.substr(0, 2);
         path += L"\\";
         path += id.substr(2, 2);
@@ -304,9 +370,36 @@ public:
         return path;
     }
 
+    std::wstring ExistingDataPath(const std::wstring& id) const
+    {
+        std::wstring path = DataPath(id);
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return path;
+        std::wstring legacy = LegacyDataPath(id);
+        if (GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return legacy;
+        return path;
+    }
+
     std::wstring MapPath(const std::wstring& dirId) const
     {
+        return MapsRoot() + L"\\" + MapLabel(dirId) + L".map";
+    }
+
+    std::wstring LegacyMapPath(const std::wstring& dirId) const
+    {
         return MapsRoot() + L"\\" + dirId + L".map";
+    }
+
+    std::wstring ExistingMapPath(const std::wstring& dirId) const
+    {
+        std::wstring path = MapPath(dirId);
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return path;
+        std::wstring legacy = LegacyMapPath(dirId);
+        if (GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return legacy;
+        return path;
     }
 
     NTSTATUS CreateFileObject(const std::wstring& id, UINT64 allocationSize)
@@ -327,12 +420,12 @@ public:
     {
         if (type == ObjectType::File)
         {
-            if (!DeleteFileW(DataPath(id).c_str()))
+            if (!DeleteFileW(ExistingDataPath(id).c_str()))
                 return Win32ToNtStatus(GetLastError());
         }
         else if (id != RootId)
         {
-            if (!DeleteFileW(MapPath(id).c_str()))
+            if (!DeleteFileW(ExistingMapPath(id).c_str()))
                 return Win32ToNtStatus(GetLastError());
         }
         return STATUS_SUCCESS;
@@ -342,10 +435,21 @@ private:
     std::wstring ObjectsRoot() const { return root_ + L"\\.objects"; }
     std::wstring MapsRoot() const { return root_ + L"\\.maps"; }
 
+    static std::wstring ObjectLabel(const std::wstring& id)
+    {
+        return DeriveStorageLabel(L"object", id);
+    }
+
+    static std::wstring MapLabel(const std::wstring& id)
+    {
+        return DeriveStorageLabel(L"map", id);
+    }
+
     NTSTATUS EnsureObjectShard(const std::wstring& id) const
     {
-        std::wstring a = ObjectsRoot() + L"\\" + id.substr(0, 2);
-        std::wstring b = a + L"\\" + id.substr(2, 2);
+        std::wstring label = ObjectLabel(id);
+        std::wstring a = ObjectsRoot() + L"\\" + label.substr(0, 2);
+        std::wstring b = a + L"\\" + label.substr(2, 2);
         NTSTATUS status = EnsureDirectory(a);
         if (!NT_SUCCESS(status))
             return status;
@@ -401,7 +505,7 @@ public:
     static NTSTATUS Load(const ObjectStore& store, const std::wstring& dirId, DirectoryMap& map)
     {
         map.Entries.clear();
-        std::wstring path = store.MapPath(dirId);
+        std::wstring path = store.ExistingMapPath(dirId);
         std::ifstream in(path, std::ios::binary);
         if (!in)
         {
@@ -438,7 +542,20 @@ public:
             std::wstring id = JsonUnescapeToWide(ReadJsonString(line, idQuote));
             std::wstring type = JsonUnescapeToWide(ReadJsonString(line, typeQuote));
 
-            map.Entries[JsonUnescapeToWide(key)] = MapEntry{ id, type == L"dir" ? ObjectType::Directory : ObjectType::File };
+            MapEntry entry{};
+            entry.Id = id;
+            entry.Type = type == L"dir" ? ObjectType::Directory : ObjectType::File;
+            entry.FileSize = ReadJsonUInt64(line, "size", 0);
+            entry.CreationTime = ReadJsonUInt64(line, "ctime", 0);
+            entry.LastAccessTime = ReadJsonUInt64(line, "atime", 0);
+            entry.LastWriteTime = ReadJsonUInt64(line, "mtime", 0);
+            entry.ChangeTime = ReadJsonUInt64(line, "chtime", entry.LastWriteTime);
+            entry.FileAttributes = static_cast<UINT32>(ReadJsonUInt64(
+                line,
+                "attrs",
+                entry.Type == ObjectType::Directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL));
+
+            map.Entries[JsonUnescapeToWide(key)] = entry;
         }
         return STATUS_SUCCESS;
     }
@@ -446,12 +563,19 @@ public:
     static NTSTATUS Save(const ObjectStore& store, const std::wstring& dirId, const DirectoryMap& map)
     {
         std::wstring path = store.MapPath(dirId);
+        std::wstring legacyPath = store.LegacyMapPath(dirId);
         std::ostringstream text;
         text << "{\n  \"entries\": {\n";
         for (auto it = map.Entries.begin(); it != map.Entries.end(); ++it)
         {
             text << "    \"" << JsonEscape(it->first) << "\": { \"id\": \"" << JsonEscape(it->second.Id)
-                << "\", \"type\": \"" << (it->second.Type == ObjectType::Directory ? "dir" : "file") << "\" }";
+                << "\", \"type\": \"" << (it->second.Type == ObjectType::Directory ? "dir" : "file")
+                << "\", \"size\": " << it->second.FileSize
+                << ", \"ctime\": " << it->second.CreationTime
+                << ", \"atime\": " << it->second.LastAccessTime
+                << ", \"mtime\": " << it->second.LastWriteTime
+                << ", \"chtime\": " << it->second.ChangeTime
+                << ", \"attrs\": " << it->second.FileAttributes << " }";
             if (std::next(it) != map.Entries.end())
                 text << ",";
             text << "\n";
@@ -466,7 +590,12 @@ public:
         if (!g_MasterKeyReady)
         {
             out.write(plain.data(), static_cast<std::streamsize>(plain.size()));
-            return out ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
+            if (!out)
+                return STATUS_ACCESS_DENIED;
+            out.close();
+            if (legacyPath != path && GetFileAttributesW(legacyPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+                DeleteFileW(legacyPath.c_str());
+            return STATUS_SUCCESS;
         }
 
         std::vector<BYTE> encrypted;
@@ -481,7 +610,13 @@ public:
         out.write(reinterpret_cast<const char*>(EncryptedMapMagic), sizeof(EncryptedMapMagic));
         if (!encrypted.empty())
             out.write(reinterpret_cast<const char*>(encrypted.data()), static_cast<std::streamsize>(encrypted.size()));
-        return out ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
+        if (!out)
+            return STATUS_ACCESS_DENIED;
+        out.close();
+
+        if (legacyPath != path && GetFileAttributesW(legacyPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+            DeleteFileW(legacyPath.c_str());
+        return STATUS_SUCCESS;
     }
 
 private:
@@ -529,6 +664,33 @@ private:
         }
         return out;
     }
+
+    static UINT64 ReadJsonUInt64(const std::string& text, const char* key, UINT64 fallback)
+    {
+        std::string token = "\"";
+        token += key;
+        token += "\"";
+        size_t keyPos = text.find(token);
+        if (keyPos == std::string::npos)
+            return fallback;
+        size_t colon = text.find(':', keyPos + token.size());
+        if (colon == std::string::npos)
+            return fallback;
+        size_t start = text.find_first_of("0123456789", colon + 1);
+        if (start == std::string::npos)
+            return fallback;
+        size_t end = start;
+        while (end < text.size() && text[end] >= '0' && text[end] <= '9')
+            ++end;
+        try
+        {
+            return std::stoull(text.substr(start, end - start));
+        }
+        catch (...)
+        {
+            return fallback;
+        }
+    }
 };
 
 class PathResolver
@@ -543,6 +705,9 @@ public:
         resolved.Id = RootId;
         resolved.Type = ObjectType::Directory;
         resolved.Exists = true;
+        resolved.Entry.Id = RootId;
+        resolved.Entry.Type = ObjectType::Directory;
+        resolved.Entry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
 
         if (parts.empty())
             return STATUS_SUCCESS;
@@ -569,6 +734,7 @@ public:
             resolved.Type = it->second.Type;
             resolved.ParentId = current;
             resolved.Name = it->first;
+            resolved.Entry = it->second;
             current = it->second.Id;
 
             if (i + 1 < parts.size() && it->second.Type != ObjectType::Directory)
@@ -614,6 +780,9 @@ struct FileContext
     std::wstring Id;
     ObjectType Type = ObjectType::File;
     std::wstring LogicalPath;
+    std::wstring ParentId;
+    std::wstring Name;
+    UINT64 LogicalSize = 0;
 };
 
 struct VaultContext
@@ -653,15 +822,36 @@ static void FillFileInfoFromAttributes(const WIN32_FILE_ATTRIBUTE_DATA& data, co
 
 static NTSTATUS GetObjectInfo(const ResolvedPath& resolved, FSP_FSCTL_FILE_INFO* info)
 {
-    std::wstring path = resolved.Type == ObjectType::File ? g_Vault->Store->DataPath(resolved.Id) : g_Vault->Store->MapPath(resolved.Id);
+    std::wstring path = resolved.Type == ObjectType::File ? g_Vault->Store->ExistingDataPath(resolved.Id) : g_Vault->Store->ExistingMapPath(resolved.Id);
     WIN32_FILE_ATTRIBUTE_DATA data{};
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
         return Win32ToNtStatus(GetLastError());
+
+    if (!resolved.ParentId.empty() || resolved.Id == RootId)
+    {
+        memset(info, 0, sizeof(*info));
+        info->FileAttributes = resolved.Type == ObjectType::Directory
+            ? FILE_ATTRIBUTE_DIRECTORY
+            : (resolved.Entry.FileAttributes ? resolved.Entry.FileAttributes : FILE_ATTRIBUTE_NORMAL);
+        info->CreationTime = resolved.Entry.CreationTime ? resolved.Entry.CreationTime : FileTimeToUInt64(data.ftCreationTime);
+        info->LastAccessTime = resolved.Entry.LastAccessTime ? resolved.Entry.LastAccessTime : FileTimeToUInt64(data.ftLastAccessTime);
+        info->LastWriteTime = resolved.Entry.LastWriteTime ? resolved.Entry.LastWriteTime : FileTimeToUInt64(data.ftLastWriteTime);
+        info->ChangeTime = resolved.Entry.ChangeTime ? resolved.Entry.ChangeTime : info->LastWriteTime;
+        if (resolved.Type == ObjectType::File)
+        {
+            info->FileSize = resolved.Entry.FileSize;
+            info->AllocationSize = RoundUp(info->FileSize, PhysicalSizeQuantum);
+        }
+        std::hash<std::wstring> h;
+        info->IndexNumber = static_cast<UINT64>(h(resolved.Id));
+        return STATUS_SUCCESS;
+    }
+
     FillFileInfoFromAttributes(data, resolved.Id, resolved.Type, info);
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS GetFileInfoByHandle(HANDLE h, const std::wstring& id, ObjectType type, FSP_FSCTL_FILE_INFO* info)
+static NTSTATUS GetFileInfoByHandle(HANDLE h, const std::wstring& id, ObjectType type, FSP_FSCTL_FILE_INFO* info, UINT64 logicalSize = UINT64_MAX)
 {
     if (type == ObjectType::Directory)
     {
@@ -686,20 +876,11 @@ static NTSTATUS GetFileInfoByHandle(HANDLE h, const std::wstring& id, ObjectType
     ULARGE_INTEGER size{};
     size.LowPart = bhi.nFileSizeLow;
     size.HighPart = bhi.nFileSizeHigh;
-    info->FileSize = size.QuadPart;
+    info->FileSize = logicalSize == UINT64_MAX ? size.QuadPart : logicalSize;
     info->AllocationSize = ((info->FileSize + 4095) / 4096) * 4096;
 
     std::hash<std::wstring> hash;
     info->IndexNumber = static_cast<UINT64>(hash(id));
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS GetHandleFileSize(HANDLE h, UINT64& size)
-{
-    LARGE_INTEGER li{};
-    if (!GetFileSizeEx(h, &li))
-        return Win32ToNtStatus(GetLastError());
-    size = static_cast<UINT64>(li.QuadPart);
     return STATUS_SUCCESS;
 }
 
@@ -735,24 +916,58 @@ static NTSTATUS WriteEncryptedZeros(FileContext* ctx, UINT64 offset, UINT64 leng
 
 static NTSTATUS SetEncryptedFileSize(FileContext* ctx, UINT64 newSize)
 {
-    UINT64 oldSize = 0;
-    NTSTATUS status = GetHandleFileSize(ctx->Handle, oldSize);
-    if (!NT_SUCCESS(status))
-        return status;
+    UINT64 oldSize = ctx->LogicalSize;
 
     if (newSize > oldSize)
     {
-        status = WriteEncryptedZeros(ctx, oldSize, newSize - oldSize);
+        NTSTATUS status = WriteEncryptedZeros(ctx, oldSize, newSize - oldSize);
         if (!NT_SUCCESS(status))
             return status;
     }
 
     LARGE_INTEGER li{};
-    li.QuadPart = static_cast<LONGLONG>(newSize);
+    li.QuadPart = static_cast<LONGLONG>(RoundUp(newSize, PhysicalSizeQuantum));
     if (!SetFilePointerEx(ctx->Handle, li, nullptr, FILE_BEGIN) || !SetEndOfFile(ctx->Handle))
         return Win32ToNtStatus(GetLastError());
 
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS SetPhysicalPaddedFileSize(FileContext* ctx, UINT64 logicalSize)
+{
+    LARGE_INTEGER li{};
+    li.QuadPart = static_cast<LONGLONG>(RoundUp(logicalSize, PhysicalSizeQuantum));
+    if (!SetFilePointerEx(ctx->Handle, li, nullptr, FILE_BEGIN) || !SetEndOfFile(ctx->Handle))
+        return Win32ToNtStatus(GetLastError());
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS UpdateEncryptedMapMetadata(FileContext* ctx, UINT64 logicalSize)
+{
+    if (!ctx || ctx->ParentId.empty() || ctx->Name.empty())
+        return STATUS_SUCCESS;
+
+    DirectoryMap parent;
+    NTSTATUS status = DirectoryMap::Load(*g_Vault->Store, ctx->ParentId, parent);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    auto it = parent.Find(ctx->Name);
+    if (it == parent.Entries.end())
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+
+    UINT64 now = CurrentFileTimeUInt64();
+    it->second.FileSize = logicalSize;
+    if (!it->second.CreationTime)
+        it->second.CreationTime = now;
+    it->second.LastAccessTime = now;
+    it->second.LastWriteTime = now;
+    it->second.ChangeTime = now;
+    it->second.FileAttributes = ctx->Type == ObjectType::Directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    status = DirectoryMap::Save(*g_Vault->Store, ctx->ParentId, parent);
+    if (NT_SUCCESS(status))
+        ctx->LogicalSize = logicalSize;
+    return status;
 }
 
 static NTSTATUS ApiGetVolumeInfo(FSP_FILE_SYSTEM*, FSP_FSCTL_VOLUME_INFO* VolumeInfo)
@@ -821,7 +1036,17 @@ static NTSTATUS ApiCreate(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions
     if (!NT_SUCCESS(status))
         return status;
 
-    parent.Entries[existing.Name] = MapEntry{ id, isDirectory ? ObjectType::Directory : ObjectType::File };
+    UINT64 now = CurrentFileTimeUInt64();
+    MapEntry newEntry{};
+    newEntry.Id = id;
+    newEntry.Type = isDirectory ? ObjectType::Directory : ObjectType::File;
+    newEntry.FileSize = 0;
+    newEntry.CreationTime = now;
+    newEntry.LastAccessTime = now;
+    newEntry.LastWriteTime = now;
+    newEntry.ChangeTime = now;
+    newEntry.FileAttributes = isDirectory ? FILE_ATTRIBUTE_DIRECTORY : (FileAttributes ? FileAttributes : FILE_ATTRIBUTE_NORMAL);
+    parent.Entries[existing.Name] = newEntry;
     status = DirectoryMap::Save(*g_Vault->Store, existing.ParentId, parent);
     if (!NT_SUCCESS(status))
         return status;
@@ -830,10 +1055,13 @@ static NTSTATUS ApiCreate(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions
     ctx->Id = id;
     ctx->Type = isDirectory ? ObjectType::Directory : ObjectType::File;
     ctx->LogicalPath = FileName ? FileName : L"";
+    ctx->ParentId = existing.ParentId;
+    ctx->Name = existing.Name;
+    ctx->LogicalSize = 0;
 
     if (!isDirectory)
     {
-        ctx->Handle = CreateFileW(g_Vault->Store->DataPath(id).c_str(), GrantedAccess, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ctx->Handle = CreateFileW(g_Vault->Store->ExistingDataPath(id).c_str(), GrantedAccess, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (ctx->Handle == INVALID_HANDLE_VALUE)
         {
             status = Win32ToNtStatus(GetLastError());
@@ -844,12 +1072,17 @@ static NTSTATUS ApiCreate(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions
             status = SetEncryptedFileSize(ctx.get(), AllocationSize);
             if (!NT_SUCCESS(status))
                 return status;
+            status = UpdateEncryptedMapMetadata(ctx.get(), AllocationSize);
+            if (!NT_SUCCESS(status))
+                return status;
         }
     }
 
     g_Vault->ClosedContexts.erase(ctx.get());
+    UINT64 logicalSize = ctx->LogicalSize;
     *PFileContext = ctx.release();
-    ResolvedPath created{ true, id, isDirectory ? ObjectType::Directory : ObjectType::File, existing.ParentId, existing.Name };
+    newEntry.FileSize = logicalSize;
+    ResolvedPath created{ true, id, isDirectory ? ObjectType::Directory : ObjectType::File, existing.ParentId, existing.Name, newEntry };
     (void)FileAttributes;
     status = GetObjectInfo(created, FileInfo);
     return status;
@@ -871,11 +1104,14 @@ static NTSTATUS ApiOpen(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, 
     ctx->Id = resolved.Id;
     ctx->Type = resolved.Type;
     ctx->LogicalPath = FileName ? FileName : L"";
+    ctx->ParentId = resolved.ParentId;
+    ctx->Name = resolved.Name;
+    ctx->LogicalSize = resolved.Entry.FileSize;
 
     if (resolved.Type == ObjectType::File)
     {
         DWORD flags = (CreateOptions & FILE_DELETE_ON_CLOSE) ? FILE_FLAG_DELETE_ON_CLOSE : FILE_ATTRIBUTE_NORMAL;
-        ctx->Handle = CreateFileW(g_Vault->Store->DataPath(resolved.Id).c_str(), GrantedAccess, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, flags, nullptr);
+        ctx->Handle = CreateFileW(g_Vault->Store->ExistingDataPath(resolved.Id).c_str(), GrantedAccess, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, flags, nullptr);
         if (ctx->Handle == INVALID_HANDLE_VALUE)
         {
             status = Win32ToNtStatus(GetLastError());
@@ -898,15 +1134,19 @@ static NTSTATUS ApiOverwrite(FSP_FILE_SYSTEM*, PVOID FileContext0, UINT32 FileAt
     LARGE_INTEGER zero{};
     if (!SetFilePointerEx(ctx->Handle, zero, nullptr, FILE_BEGIN) || !SetEndOfFile(ctx->Handle))
         return Win32ToNtStatus(GetLastError());
+    ctx->LogicalSize = 0;
     if (AllocationSize)
     {
         NTSTATUS status = SetEncryptedFileSize(ctx, AllocationSize);
         if (!NT_SUCCESS(status))
             return status;
     }
+    NTSTATUS metadataStatus = UpdateEncryptedMapMetadata(ctx, AllocationSize);
+    if (!NT_SUCCESS(metadataStatus))
+        return metadataStatus;
     (void)FileAttributes;
     (void)ReplaceFileAttributes;
-    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo);
+    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
 }
 
 static void ApiCleanup(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, ULONG Flags)
@@ -958,6 +1198,13 @@ static NTSTATUS ApiRead(FSP_FILE_SYSTEM*, PVOID FileContext0, PVOID Buffer, UINT
     auto ctx = static_cast<FileContext*>(FileContext0);
     if (!ctx || ctx->Type != ObjectType::File)
         return STATUS_INVALID_HANDLE;
+    if (Offset >= ctx->LogicalSize)
+    {
+        *PBytesTransferred = 0;
+        return STATUS_SUCCESS;
+    }
+    if (Offset + Length > ctx->LogicalSize)
+        Length = static_cast<ULONG>(ctx->LogicalSize - Offset);
 
     LARGE_INTEGER li{};
     li.QuadPart = static_cast<LONGLONG>(Offset);
@@ -980,9 +1227,9 @@ static NTSTATUS ApiWrite(FSP_FILE_SYSTEM*, PVOID FileContext0, PVOID Buffer, UIN
     if (!ctx || ctx->Type != ObjectType::File)
         return STATUS_INVALID_HANDLE;
 
-    DWORD moveMethod = WriteToEndOfFile ? FILE_END : FILE_BEGIN;
+    DWORD moveMethod = FILE_BEGIN;
     LARGE_INTEGER li{};
-    li.QuadPart = WriteToEndOfFile ? 0 : static_cast<LONGLONG>(Offset);
+    li.QuadPart = static_cast<LONGLONG>(WriteToEndOfFile ? ctx->LogicalSize : Offset);
     LARGE_INTEGER writePosition{};
     if (!SetFilePointerEx(ctx->Handle, li, &writePosition, moveMethod))
         return Win32ToNtStatus(GetLastError());
@@ -999,7 +1246,14 @@ static NTSTATUS ApiWrite(FSP_FILE_SYSTEM*, PVOID FileContext0, PVOID Buffer, UIN
         return Win32ToNtStatus(GetLastError());
 
     *PBytesTransferred = written;
-    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo);
+    UINT64 newLogicalSize = std::max<UINT64>(ctx->LogicalSize, static_cast<UINT64>(writePosition.QuadPart) + written);
+    status = SetPhysicalPaddedFileSize(ctx, newLogicalSize);
+    if (!NT_SUCCESS(status))
+        return status;
+    status = UpdateEncryptedMapMetadata(ctx, newLogicalSize);
+    if (!NT_SUCCESS(status))
+        return status;
+    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
 }
 
 static NTSTATUS ApiFlush(FSP_FILE_SYSTEM*, PVOID FileContext0, FSP_FSCTL_FILE_INFO* FileInfo)
@@ -1009,7 +1263,7 @@ static NTSTATUS ApiFlush(FSP_FILE_SYSTEM*, PVOID FileContext0, FSP_FSCTL_FILE_IN
     {
         if (!FlushFileBuffers(ctx->Handle))
             return Win32ToNtStatus(GetLastError());
-        return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo);
+        return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
     }
     return STATUS_SUCCESS;
 }
@@ -1019,26 +1273,48 @@ static NTSTATUS ApiGetFileInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, FSP_FSCTL_F
     auto ctx = static_cast<FileContext*>(FileContext0);
     if (!ctx)
         return STATUS_INVALID_HANDLE;
-    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo);
+    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
 }
 
 static NTSTATUS ApiSetBasicInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, UINT32 FileAttributes, UINT64 CreationTime, UINT64 LastAccessTime, UINT64 LastWriteTime, UINT64 ChangeTime, FSP_FSCTL_FILE_INFO* FileInfo)
 {
     auto ctx = static_cast<FileContext*>(FileContext0);
-    if (!ctx || ctx->Type != ObjectType::File)
-        return STATUS_SUCCESS;
+    if (!ctx)
+        return STATUS_INVALID_HANDLE;
 
-    auto toft = [](UINT64 t) {
-        FILETIME ft{};
-        ft.dwLowDateTime = static_cast<DWORD>(t);
-        ft.dwHighDateTime = static_cast<DWORD>(t >> 32);
-        return ft;
-    };
-    FILETIME c = toft(CreationTime), a = toft(LastAccessTime), w = toft(LastWriteTime ? LastWriteTime : ChangeTime);
-    if (!SetFileTime(ctx->Handle, CreationTime ? &c : nullptr, LastAccessTime ? &a : nullptr, (LastWriteTime || ChangeTime) ? &w : nullptr))
-        return Win32ToNtStatus(GetLastError());
-    (void)FileAttributes;
-    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo);
+    if (!ctx->ParentId.empty() && !ctx->Name.empty())
+    {
+        DirectoryMap parent;
+        NTSTATUS status = DirectoryMap::Load(*g_Vault->Store, ctx->ParentId, parent);
+        if (!NT_SUCCESS(status))
+            return status;
+        auto it = parent.Find(ctx->Name);
+        if (it == parent.Entries.end())
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        if (FileAttributes)
+            it->second.FileAttributes = FileAttributes;
+        if (CreationTime)
+            it->second.CreationTime = CreationTime;
+        if (LastAccessTime)
+            it->second.LastAccessTime = LastAccessTime;
+        if (LastWriteTime)
+            it->second.LastWriteTime = LastWriteTime;
+        if (ChangeTime)
+            it->second.ChangeTime = ChangeTime;
+        status = DirectoryMap::Save(*g_Vault->Store, ctx->ParentId, parent);
+        if (!NT_SUCCESS(status))
+            return status;
+    }
+
+    if (ctx->Type == ObjectType::Directory)
+    {
+        ResolvedPath resolved;
+        NTSTATUS status = g_Vault->Resolver->ResolvePath(ctx->LogicalPath, resolved);
+        if (!NT_SUCCESS(status))
+            return status;
+        return GetObjectInfo(resolved, FileInfo);
+    }
+    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
 }
 
 static NTSTATUS ApiSetFileSize(FSP_FILE_SYSTEM*, PVOID FileContext0, UINT64 NewSize, BOOLEAN SetAllocationSize, FSP_FSCTL_FILE_INFO* FileInfo)
@@ -1050,8 +1326,11 @@ static NTSTATUS ApiSetFileSize(FSP_FILE_SYSTEM*, PVOID FileContext0, UINT64 NewS
     NTSTATUS status = SetEncryptedFileSize(ctx, NewSize);
     if (!NT_SUCCESS(status))
         return status;
+    status = UpdateEncryptedMapMetadata(ctx, NewSize);
+    if (!NT_SUCCESS(status))
+        return status;
     (void)SetAllocationSize;
-    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo);
+    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
 }
 
 static NTSTATUS ApiCanDelete(FSP_FILE_SYSTEM*, PVOID, PWSTR FileName)
@@ -1135,12 +1414,18 @@ static NTSTATUS ApiRename(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, 
     if (sameParent)
     {
         srcParent.Entries.erase(src.Name);
-        srcParent.Entries[dstName] = MapEntry{ src.Id, src.Type };
+        MapEntry moved = src.Entry;
+        moved.Id = src.Id;
+        moved.Type = src.Type;
+        srcParent.Entries[dstName] = moved;
         status = DirectoryMap::Save(*g_Vault->Store, src.ParentId, srcParent);
         return status;
     }
 
-    dstParent.Entries[dstName] = MapEntry{ src.Id, src.Type };
+    MapEntry moved = src.Entry;
+    moved.Id = src.Id;
+    moved.Type = src.Type;
+    dstParent.Entries[dstName] = moved;
     srcParent.Entries.erase(src.Name);
 
     status = DirectoryMap::Save(*g_Vault->Store, src.ParentId, srcParent);
@@ -1215,6 +1500,10 @@ static NTSTATUS ApiGetDirInfoByName(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR 
     if (FileName && (FileName[0] == L'\\' || FileName[0] == L'/'))
     {
         childPath = FileName;
+    }
+    else if (FileName && !ctx->Name.empty() && _wcsicmp(FileName, ctx->Name.c_str()) == 0)
+    {
+        childPath = ctx->LogicalPath;
     }
     else
     {
