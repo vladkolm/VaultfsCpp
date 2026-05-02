@@ -173,6 +173,23 @@ static bool IsName(const wchar_t* value, const wchar_t* expected)
     return value && expected && 0 == wcscmp(value, expected);
 }
 
+static bool CaseInsensitiveEquals(const wchar_t* left, const wchar_t* right)
+{
+    if (!left || !right)
+        return false;
+    return CSTR_EQUAL == CompareStringOrdinal(left, -1, right, -1, TRUE);
+}
+
+static int CaseInsensitiveCompare(const wchar_t* left, const wchar_t* right)
+{
+    return CompareStringOrdinal(left ? left : L"", -1, right ? right : L"", -1, TRUE);
+}
+
+static bool CaseInsensitiveCharEquals(wchar_t left, wchar_t right)
+{
+    return CSTR_EQUAL == CompareStringOrdinal(&left, 1, &right, 1, TRUE);
+}
+
 static bool WildcardMatch(const wchar_t* pattern, const wchar_t* text)
 {
     if (pattern == nullptr || pattern[0] == L'\0')
@@ -183,7 +200,7 @@ static bool WildcardMatch(const wchar_t* pattern, const wchar_t* text)
         return WildcardMatch(pattern + 1, text) || (*text && WildcardMatch(pattern, text + 1));
     if (*pattern == L'?')
         return *text && WildcardMatch(pattern + 1, text + 1);
-    return towlower(*pattern) == towlower(*text) && WildcardMatch(pattern + 1, text + 1);
+    return CaseInsensitiveCharEquals(*pattern, *text) && WildcardMatch(pattern + 1, text + 1);
 }
 
 static void CopyDirInfoName(FSP_FSCTL_DIR_INFO* dirInfo, const std::wstring& name)
@@ -511,7 +528,7 @@ public:
 
         for (auto it = Entries.begin(); it != Entries.end(); ++it)
         {
-            if (_wcsicmp(it->first.c_str(), name.c_str()) == 0)
+            if (CaseInsensitiveEquals(it->first.c_str(), name.c_str()))
                 return it;
         }
         return Entries.end();
@@ -525,7 +542,7 @@ public:
 
         for (auto it = Entries.begin(); it != Entries.end(); ++it)
         {
-            if (_wcsicmp(it->first.c_str(), name.c_str()) == 0)
+            if (CaseInsensitiveEquals(it->first.c_str(), name.c_str()))
                 return it;
         }
         return Entries.end();
@@ -1546,8 +1563,14 @@ static NTSTATUS ApiRename(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, 
     std::wstring newPath = NewFileName ? NewFileName : L"";
 
     std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
+    auto ctx = static_cast<FileContext*>(FileContext0);
     ResolvedPath src;
     NTSTATUS status = g_Vault->Resolver->ResolvePath(oldPath, src);
+    if ((!NT_SUCCESS(status) || !src.Exists) && ctx && !ctx->LogicalPath.empty())
+    {
+        oldPath = ctx->LogicalPath;
+        status = g_Vault->Resolver->ResolvePath(oldPath, src);
+    }
     if (!NT_SUCCESS(status))
         return status;
     if (!src.Exists || src.Id == RootId)
@@ -1557,7 +1580,7 @@ static NTSTATUS ApiRename(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, 
     status = g_Vault->Resolver->ResolvePath(newPath, dst);
     if (!NT_SUCCESS(status))
         return status;
-    if (dst.Exists && !ReplaceIfExists)
+    if (dst.Exists && dst.Id != src.Id && !ReplaceIfExists)
         return STATUS_OBJECT_NAME_COLLISION;
 
     std::wstring dstParentId, dstName;
@@ -1581,17 +1604,26 @@ static NTSTATUS ApiRename(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, 
 
     if (dst.Exists)
     {
-        if (dst.Type == ObjectType::Directory)
+        if (dst.Id == src.Id)
         {
-            DirectoryMap existingDir;
-            status = DirectoryMap::Load(*g_Vault->Store, dst.Id, existingDir);
-            if (!NT_SUCCESS(status))
-                return status;
-            if (!existingDir.Entries.empty())
-                return STATUS_DIRECTORY_NOT_EMPTY;
+            dst.Exists = false;
         }
-        dstParent.Entries.erase(dstName);
-        g_Vault->Store->DeleteObject(dst.Id, dst.Type);
+        else
+        {
+            if (dst.Type == ObjectType::Directory)
+            {
+                DirectoryMap existingDir;
+                status = DirectoryMap::Load(*g_Vault->Store, dst.Id, existingDir);
+                if (!NT_SUCCESS(status))
+                    return status;
+                if (!existingDir.Entries.empty())
+                    return STATUS_DIRECTORY_NOT_EMPTY;
+            }
+            dstParent.Entries.erase(dst.Name);
+            if (sameParent)
+                srcParent.Entries.erase(dst.Name);
+            g_Vault->Store->DeleteObject(dst.Id, dst.Type);
+        }
     }
 
     if (sameParent)
@@ -1602,6 +1634,12 @@ static NTSTATUS ApiRename(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, 
         moved.Type = src.Type;
         srcParent.Entries[dstName] = moved;
         status = DirectoryMap::Save(*g_Vault->Store, src.ParentId, srcParent);
+        if (NT_SUCCESS(status) && ctx)
+        {
+            ctx->LogicalPath = newPath;
+            ctx->ParentId = dstParentId;
+            ctx->Name = dstName;
+        }
         return status;
     }
 
@@ -1615,7 +1653,12 @@ static NTSTATUS ApiRename(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, 
     if (!NT_SUCCESS(status))
         return status;
     status = DirectoryMap::Save(*g_Vault->Store, dstParentId, dstParent);
-    (void)FileContext0;
+    if (NT_SUCCESS(status) && ctx)
+    {
+        ctx->LogicalPath = newPath;
+        ctx->ParentId = dstParentId;
+        ctx->Name = dstName;
+    }
     return status;
 }
 
@@ -1685,7 +1728,7 @@ static NTSTATUS ApiReadDirectory(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR Pat
     {
         const std::wstring& name = it->first;
         const MapEntry& entry = it->second;
-        if (Marker && _wcsicmp(name.c_str(), Marker) <= 0)
+        if (Marker && CaseInsensitiveCompare(name.c_str(), Marker) <= CSTR_EQUAL)
             continue;
         if (Pattern && !WildcardMatch(Pattern, name.c_str()))
             continue;
@@ -1735,7 +1778,7 @@ static NTSTATUS ApiGetDirInfoByName(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR 
     {
         childPath = FileName;
     }
-    else if (FileName && !ctx->Name.empty() && _wcsicmp(FileName, ctx->Name.c_str()) == 0)
+    else if (FileName && !ctx->Name.empty() && CaseInsensitiveEquals(FileName, ctx->Name.c_str()))
     {
         childPath = ctx->LogicalPath;
     }
