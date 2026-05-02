@@ -56,6 +56,15 @@ static constexpr wchar_t RootId[] = L"root";
 static wchar_t DiskDeviceName[] = L"WinFsp.Disk";
 static constexpr UINT64 PhysicalSizeQuantum = 4096;
 
+static UINT32 NormalizeFileAttributes(UINT32 attributes, ObjectType type)
+{
+    if (attributes == 0 || attributes == INVALID_FILE_ATTRIBUTES)
+        return type == ObjectType::Directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    if (type == ObjectType::Directory)
+        return attributes | FILE_ATTRIBUTE_DIRECTORY;
+    return attributes & ~FILE_ATTRIBUTE_DIRECTORY;
+}
+
 static NTSTATUS Win32ToNtStatus(DWORD error)
 {
     return FspNtStatusFromWin32(error);
@@ -582,37 +591,30 @@ public:
         }
         text << "  }\n}\n";
 
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        if (!out)
-            return Win32ToNtStatus(GetLastError());
-
         std::string plain = text.str();
+        std::vector<BYTE> encoded;
         if (!g_MasterKeyReady)
         {
-            out.write(plain.data(), static_cast<std::streamsize>(plain.size()));
-            if (!out)
-                return STATUS_ACCESS_DENIED;
-            out.close();
-            if (legacyPath != path && GetFileAttributesW(legacyPath.c_str()) != INVALID_FILE_ATTRIBUTES)
-                DeleteFileW(legacyPath.c_str());
-            return STATUS_SUCCESS;
+            encoded.assign(plain.begin(), plain.end());
+        }
+        else
+        {
+            std::vector<BYTE> encrypted;
+            encrypted.reserve(plain.size());
+            for (char ch : plain)
+                encrypted.push_back(static_cast<BYTE>(ch));
+
+            NTSTATUS status = ApplyContentCipher(g_MasterKey, MapCipherId(dirId), 0, encrypted.data(), static_cast<ULONG>(encrypted.size()));
+            if (!NT_SUCCESS(status))
+                return status;
+
+            encoded.insert(encoded.end(), EncryptedMapMagic, EncryptedMapMagic + sizeof(EncryptedMapMagic));
+            encoded.insert(encoded.end(), encrypted.begin(), encrypted.end());
         }
 
-        std::vector<BYTE> encrypted;
-        encrypted.reserve(plain.size());
-        for (char ch : plain)
-            encrypted.push_back(static_cast<BYTE>(ch));
-
-        NTSTATUS status = ApplyContentCipher(g_MasterKey, MapCipherId(dirId), 0, encrypted.data(), static_cast<ULONG>(encrypted.size()));
+        NTSTATUS status = WriteAtomicFile(path, encoded);
         if (!NT_SUCCESS(status))
             return status;
-
-        out.write(reinterpret_cast<const char*>(EncryptedMapMagic), sizeof(EncryptedMapMagic));
-        if (!encrypted.empty())
-            out.write(reinterpret_cast<const char*>(encrypted.data()), static_cast<std::streamsize>(encrypted.size()));
-        if (!out)
-            return STATUS_ACCESS_DENIED;
-        out.close();
 
         if (legacyPath != path && GetFileAttributesW(legacyPath.c_str()) != INVALID_FILE_ATTRIBUTES)
             DeleteFileW(legacyPath.c_str());
@@ -620,6 +622,77 @@ public:
     }
 
 private:
+    static NTSTATUS WriteAtomicFile(const std::wstring& path, const std::vector<BYTE>& bytes)
+    {
+        std::wstring tmpPath = MakeTempPath(path);
+        std::wstring backupPath = path + L".bak";
+
+        NTSTATUS status = WriteFileFullyAndFlush(tmpPath, bytes);
+        if (!NT_SUCCESS(status))
+            return status;
+
+        if (ReplaceFileW(path.c_str(), tmpPath.c_str(), backupPath.c_str(), REPLACEFILE_WRITE_THROUGH, nullptr, nullptr))
+        {
+            DeleteFileW(backupPath.c_str());
+            return STATUS_SUCCESS;
+        }
+
+        DWORD replaceError = GetLastError();
+        if (replaceError == ERROR_FILE_NOT_FOUND || replaceError == ERROR_PATH_NOT_FOUND)
+        {
+            if (MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH))
+                return STATUS_SUCCESS;
+            replaceError = GetLastError();
+        }
+
+        DeleteFileW(tmpPath.c_str());
+        return Win32ToNtStatus(replaceError);
+    }
+
+    static NTSTATUS WriteFileFullyAndFlush(const std::wstring& path, const std::vector<BYTE>& bytes)
+    {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+        if (h == INVALID_HANDLE_VALUE)
+            return Win32ToNtStatus(GetLastError());
+
+        DWORD error = ERROR_SUCCESS;
+        size_t done = 0;
+        while (done < bytes.size())
+        {
+            DWORD chunk = static_cast<DWORD>(std::min<size_t>(bytes.size() - done, 1024 * 1024));
+            DWORD written = 0;
+            if (!WriteFile(h, bytes.data() + done, chunk, &written, nullptr))
+            {
+                error = GetLastError();
+                break;
+            }
+            if (written == 0)
+            {
+                error = ERROR_WRITE_FAULT;
+                break;
+            }
+            done += written;
+        }
+
+        if (error == ERROR_SUCCESS && !FlushFileBuffers(h))
+            error = GetLastError();
+
+        CloseHandle(h);
+        if (error != ERROR_SUCCESS)
+        {
+            DeleteFileW(path.c_str());
+            return Win32ToNtStatus(error);
+        }
+        return STATUS_SUCCESS;
+    }
+
+    static std::wstring MakeTempPath(const std::wstring& path)
+    {
+        wchar_t suffix[64]{};
+        swprintf_s(suffix, L".tmp.%lu.%llu", GetCurrentProcessId(), static_cast<unsigned long long>(GetTickCount64()));
+        return path + suffix;
+    }
+
     static NTSTATUS DecodeMapText(const std::wstring& dirId, const std::string& raw, std::string& text)
     {
         if (raw.size() < sizeof(EncryptedMapMagic) ||
@@ -783,6 +856,12 @@ struct FileContext
     std::wstring ParentId;
     std::wstring Name;
     UINT64 LogicalSize = 0;
+    bool DeletePending = false;
+    bool LogicalDeleted = false;
+    bool PhysicalDeleted = false;
+    std::wstring DeletedParentId;
+    std::wstring DeletedName;
+    MapEntry DeletedEntry;
 };
 
 struct VaultContext
@@ -791,12 +870,14 @@ struct VaultContext
     std::unique_ptr<ObjectStore> Store;
     std::unique_ptr<PathResolver> Resolver;
     std::array<BYTE, 32> MasterKey{};
-    std::mutex MapMutex;
-    std::set<PVOID> ClosedContexts;
+    std::recursive_mutex MapMutex;
+    std::set<FileContext*> LiveContexts;
+    std::vector<std::unique_ptr<FileContext>> RetiredContexts;
     FSP_FILE_SYSTEM* FileSystem = nullptr;
 };
 
 static VaultContext* g_Vault = nullptr;
+
 static HANDLE g_StopEvent = nullptr;
 
 static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType)
@@ -847,9 +928,7 @@ static NTSTATUS GetObjectInfo(const ResolvedPath& resolved, FSP_FSCTL_FILE_INFO*
     if (!resolved.ParentId.empty() || resolved.Id == RootId)
     {
         memset(info, 0, sizeof(*info));
-        info->FileAttributes = resolved.Type == ObjectType::Directory
-            ? FILE_ATTRIBUTE_DIRECTORY
-            : (resolved.Entry.FileAttributes ? resolved.Entry.FileAttributes : FILE_ATTRIBUTE_NORMAL);
+        info->FileAttributes = NormalizeFileAttributes(resolved.Entry.FileAttributes, resolved.Type);
         info->CreationTime = resolved.Entry.CreationTime ? resolved.Entry.CreationTime : FileTimeToUInt64(data.ftCreationTime);
         info->LastAccessTime = resolved.Entry.LastAccessTime ? resolved.Entry.LastAccessTime : FileTimeToUInt64(data.ftLastAccessTime);
         info->LastWriteTime = resolved.Entry.LastWriteTime ? resolved.Entry.LastWriteTime : FileTimeToUInt64(data.ftLastWriteTime);
@@ -964,6 +1043,7 @@ static NTSTATUS UpdateEncryptedMapMetadata(FileContext* ctx, UINT64 logicalSize)
     if (!ctx || ctx->ParentId.empty() || ctx->Name.empty())
         return STATUS_SUCCESS;
 
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     DirectoryMap parent;
     NTSTATUS status = DirectoryMap::Load(*g_Vault->Store, ctx->ParentId, parent);
     if (!NT_SUCCESS(status))
@@ -999,7 +1079,7 @@ static NTSTATUS ApiGetVolumeInfo(FSP_FILE_SYSTEM*, FSP_FSCTL_VOLUME_INFO* Volume
 static NTSTATUS ApiGetSecurityByName(FSP_FILE_SYSTEM*, PWSTR FileName, PUINT32 PFileAttributes, PSECURITY_DESCRIPTOR SecurityDescriptor, SIZE_T* PSecurityDescriptorSize)
 {
     std::wstring logicalPath = FileName ? FileName : L"";
-    std::lock_guard<std::mutex> lock(g_Vault->MapMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     ResolvedPath resolved;
     NTSTATUS status = g_Vault->Resolver->ResolvePath(logicalPath, resolved);
     if (!NT_SUCCESS(status))
@@ -1025,7 +1105,7 @@ static NTSTATUS ApiCreate(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions
 {
     std::wstring logicalPath = FileName ? FileName : L"";
 
-    std::lock_guard<std::mutex> lock(g_Vault->MapMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     bool isDirectory = 0 != (CreateOptions & FILE_DIRECTORY_FILE);
 
     ResolvedPath existing;
@@ -1062,7 +1142,7 @@ static NTSTATUS ApiCreate(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions
     newEntry.LastAccessTime = now;
     newEntry.LastWriteTime = now;
     newEntry.ChangeTime = now;
-    newEntry.FileAttributes = isDirectory ? FILE_ATTRIBUTE_DIRECTORY : (FileAttributes ? FileAttributes : FILE_ATTRIBUTE_NORMAL);
+    newEntry.FileAttributes = NormalizeFileAttributes(FileAttributes, newEntry.Type);
     parent.Entries[existing.Name] = newEntry;
     status = DirectoryMap::Save(*g_Vault->Store, existing.ParentId, parent);
     if (!NT_SUCCESS(status))
@@ -1095,9 +1175,10 @@ static NTSTATUS ApiCreate(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions
         }
     }
 
-    g_Vault->ClosedContexts.erase(ctx.get());
     UINT64 logicalSize = ctx->LogicalSize;
-    *PFileContext = ctx.release();
+    FileContext* rawCtx = ctx.release();
+    g_Vault->LiveContexts.insert(rawCtx);
+    *PFileContext = rawCtx;
     newEntry.FileSize = logicalSize;
     ResolvedPath created{ true, id, isDirectory ? ObjectType::Directory : ObjectType::File, existing.ParentId, existing.Name, newEntry };
     (void)FileAttributes;
@@ -1109,7 +1190,7 @@ static NTSTATUS ApiOpen(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, 
 {
     std::wstring logicalPath = FileName ? FileName : L"";
 
-    std::lock_guard<std::mutex> lock(g_Vault->MapMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     ResolvedPath resolved;
     NTSTATUS status = g_Vault->Resolver->ResolvePath(logicalPath, resolved);
     if (!NT_SUCCESS(status))
@@ -1136,8 +1217,9 @@ static NTSTATUS ApiOpen(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, 
         }
     }
 
-    g_Vault->ClosedContexts.erase(ctx.get());
-    *PFileContext = ctx.release();
+    FileContext* rawCtx = ctx.release();
+    g_Vault->LiveContexts.insert(rawCtx);
+    *PFileContext = rawCtx;
     status = GetObjectInfo(resolved, FileInfo);
     return status;
 }
@@ -1170,16 +1252,18 @@ static void ApiCleanup(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, ULO
 {
     auto ctx = static_cast<FileContext*>(FileContext0);
 
-    if (!(Flags & FspCleanupDelete))
+    bool deleteRequested = 0 != (Flags & FspCleanupDelete);
+    if (!deleteRequested && (!ctx || !ctx->DeletePending))
         return;
 
-    if (ctx && ctx->Handle != INVALID_HANDLE_VALUE)
+    if (ctx && ctx->LogicalDeleted)
     {
-        CloseHandle(ctx->Handle);
-        ctx->Handle = INVALID_HANDLE_VALUE;
+        if (!ctx->PhysicalDeleted && NT_SUCCESS(g_Vault->Store->DeleteObject(ctx->Id, ctx->Type)))
+            ctx->PhysicalDeleted = true;
+        return;
     }
 
-    std::lock_guard<std::mutex> lock(g_Vault->MapMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     ResolvedPath resolved;
     std::wstring logicalPath = FileName && FileName[0] ? FileName : (ctx ? ctx->LogicalPath : L"");
     if (!NT_SUCCESS(g_Vault->Resolver->ResolvePath(logicalPath, resolved)) || !resolved.Exists || resolved.Id == RootId)
@@ -1191,7 +1275,17 @@ static void ApiCleanup(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, ULO
 
     parent.Entries.erase(resolved.Name);
     DirectoryMap::Save(*g_Vault->Store, resolved.ParentId, parent);
-    g_Vault->Store->DeleteObject(resolved.Id, resolved.Type);
+    if (ctx)
+    {
+        ctx->Id = resolved.Id;
+        ctx->Type = resolved.Type;
+        ctx->DeletedParentId = resolved.ParentId;
+        ctx->DeletedName = resolved.Name;
+        ctx->DeletedEntry = resolved.Entry;
+        ctx->LogicalDeleted = true;
+    }
+    if (!ctx)
+        g_Vault->Store->DeleteObject(resolved.Id, resolved.Type);
 }
 
 static void ApiClose(FSP_FILE_SYSTEM*, PVOID FileContext0)
@@ -1200,14 +1294,20 @@ static void ApiClose(FSP_FILE_SYSTEM*, PVOID FileContext0)
     if (!ctx)
         return;
 
-    std::lock_guard<std::mutex> lock(g_Vault->MapMutex);
-    if (g_Vault->ClosedContexts.find(ctx) != g_Vault->ClosedContexts.end())
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
+    auto live = g_Vault->LiveContexts.find(ctx);
+    if (live == g_Vault->LiveContexts.end())
         return;
-    g_Vault->ClosedContexts.insert(ctx);
+    g_Vault->LiveContexts.erase(live);
 
     if (ctx->Handle != INVALID_HANDLE_VALUE)
+    {
         CloseHandle(ctx->Handle);
-    delete ctx;
+        ctx->Handle = INVALID_HANDLE_VALUE;
+    }
+    if (ctx->LogicalDeleted && !ctx->PhysicalDeleted)
+        g_Vault->Store->DeleteObject(ctx->Id, ctx->Type);
+    g_Vault->RetiredContexts.emplace_back(ctx);
 }
 
 static NTSTATUS ApiRead(FSP_FILE_SYSTEM*, PVOID FileContext0, PVOID Buffer, UINT64 Offset, ULONG Length, PULONG PBytesTransferred)
@@ -1215,6 +1315,11 @@ static NTSTATUS ApiRead(FSP_FILE_SYSTEM*, PVOID FileContext0, PVOID Buffer, UINT
     auto ctx = static_cast<FileContext*>(FileContext0);
     if (!ctx || ctx->Type != ObjectType::File)
         return STATUS_INVALID_HANDLE;
+    if (ctx->Handle == INVALID_HANDLE_VALUE)
+    {
+        *PBytesTransferred = 0;
+        return STATUS_SUCCESS;
+    }
     if (Offset >= ctx->LogicalSize)
     {
         *PBytesTransferred = 0;
@@ -1273,9 +1378,13 @@ static NTSTATUS ApiWrite(FSP_FILE_SYSTEM*, PVOID FileContext0, PVOID Buffer, UIN
     return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
 }
 
+static NTSTATUS ApiGetFileInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, FSP_FSCTL_FILE_INFO* FileInfo);
+
 static NTSTATUS ApiFlush(FSP_FILE_SYSTEM*, PVOID FileContext0, FSP_FSCTL_FILE_INFO* FileInfo)
 {
     auto ctx = static_cast<FileContext*>(FileContext0);
+    if (ctx && ctx->Handle == INVALID_HANDLE_VALUE)
+        return ApiGetFileInfo(nullptr, FileContext0, FileInfo);
     if (ctx && ctx->Type == ObjectType::File && ctx->Handle != INVALID_HANDLE_VALUE)
     {
         if (!FlushFileBuffers(ctx->Handle))
@@ -1290,7 +1399,37 @@ static NTSTATUS ApiGetFileInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, FSP_FSCTL_F
     auto ctx = static_cast<FileContext*>(FileContext0);
     if (!ctx)
         return STATUS_INVALID_HANDLE;
-    return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
+
+    if (ctx->LogicalDeleted)
+    {
+        memset(FileInfo, 0, sizeof(*FileInfo));
+        FileInfo->FileAttributes = ctx->Type == ObjectType::Directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+        if (ctx->Type == ObjectType::File)
+        {
+            FileInfo->FileSize = ctx->LogicalSize;
+            FileInfo->AllocationSize = RoundUp(ctx->LogicalSize, PhysicalSizeQuantum);
+        }
+        std::hash<std::wstring> hash;
+        FileInfo->IndexNumber = static_cast<UINT64>(hash(ctx->Id));
+        return STATUS_SUCCESS;
+    }
+
+    NTSTATUS status = STATUS_SUCCESS;
+    if (!ctx->LogicalPath.empty())
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
+        ResolvedPath resolved;
+        status = g_Vault->Resolver->ResolvePath(ctx->LogicalPath, resolved);
+        if (NT_SUCCESS(status) && resolved.Exists)
+            status = GetObjectInfo(resolved, FileInfo);
+        else
+            status = GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
+    }
+    else
+    {
+        status = GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
+    }
+    return status;
 }
 
 static NTSTATUS ApiSetBasicInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, UINT32 FileAttributes, UINT64 CreationTime, UINT64 LastAccessTime, UINT64 LastWriteTime, UINT64 ChangeTime, FSP_FSCTL_FILE_INFO* FileInfo)
@@ -1298,7 +1437,10 @@ static NTSTATUS ApiSetBasicInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, UINT32 Fil
     auto ctx = static_cast<FileContext*>(FileContext0);
     if (!ctx)
         return STATUS_INVALID_HANDLE;
+    if (ctx->LogicalDeleted)
+        return ApiGetFileInfo(nullptr, FileContext0, FileInfo);
 
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     if (!ctx->ParentId.empty() && !ctx->Name.empty())
     {
         DirectoryMap parent;
@@ -1308,8 +1450,8 @@ static NTSTATUS ApiSetBasicInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, UINT32 Fil
         auto it = parent.Find(ctx->Name);
         if (it == parent.Entries.end())
             return STATUS_OBJECT_NAME_NOT_FOUND;
-        if (FileAttributes)
-            it->second.FileAttributes = FileAttributes;
+        if (FileAttributes != 0 && FileAttributes != INVALID_FILE_ATTRIBUTES)
+            it->second.FileAttributes = NormalizeFileAttributes(FileAttributes, it->second.Type);
         if (CreationTime)
             it->second.CreationTime = CreationTime;
         if (LastAccessTime)
@@ -1331,6 +1473,8 @@ static NTSTATUS ApiSetBasicInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, UINT32 Fil
             return status;
         return GetObjectInfo(resolved, FileInfo);
     }
+    if (ctx->Handle == INVALID_HANDLE_VALUE)
+        return ApiGetFileInfo(nullptr, FileContext0, FileInfo);
     return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
 }
 
@@ -1350,11 +1494,13 @@ static NTSTATUS ApiSetFileSize(FSP_FILE_SYSTEM*, PVOID FileContext0, UINT64 NewS
     return GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
 }
 
-static NTSTATUS ApiCanDelete(FSP_FILE_SYSTEM*, PVOID, PWSTR FileName)
+static NTSTATUS ApiCanDelete(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName)
 {
-    std::lock_guard<std::mutex> lock(g_Vault->MapMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
+    auto ctx = static_cast<FileContext*>(FileContext0);
+    std::wstring logicalPath = FileName && FileName[0] ? FileName : (ctx ? ctx->LogicalPath : L"");
     ResolvedPath resolved;
-    NTSTATUS status = g_Vault->Resolver->ResolvePath(FileName ? FileName : L"", resolved);
+    NTSTATUS status = g_Vault->Resolver->ResolvePath(logicalPath, resolved);
     if (!NT_SUCCESS(status))
         return status;
     if (!resolved.Exists)
@@ -1379,7 +1525,7 @@ static NTSTATUS ApiRename(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, 
     std::wstring oldPath = FileName ? FileName : L"";
     std::wstring newPath = NewFileName ? NewFileName : L"";
 
-    std::lock_guard<std::mutex> lock(g_Vault->MapMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     ResolvedPath src;
     NTSTATUS status = g_Vault->Resolver->ResolvePath(oldPath, src);
     if (!NT_SUCCESS(status))
@@ -1459,7 +1605,7 @@ static NTSTATUS ApiReadDirectory(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR Pat
     if (!ctx || ctx->Type != ObjectType::Directory)
         return STATUS_NOT_A_DIRECTORY;
 
-    std::lock_guard<std::mutex> lock(g_Vault->MapMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     ResolvedPath dir;
     NTSTATUS status = g_Vault->Resolver->ResolvePath(ctx->LogicalPath, dir);
     if (!NT_SUCCESS(status))
@@ -1496,7 +1642,7 @@ static NTSTATUS ApiReadDirectory(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR Pat
         if (Pattern && !WildcardMatch(Pattern, name.c_str()))
             continue;
 
-        ResolvedPath child{ true, entry.Id, entry.Type, dir.Id, name };
+        ResolvedPath child{ true, entry.Id, entry.Type, dir.Id, name, entry };
         if (!addDirEntry(name, child))
             break;
     }
@@ -1512,7 +1658,7 @@ static NTSTATUS ApiGetDirInfoByName(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR 
     if (!ctx || ctx->Type != ObjectType::Directory)
         return STATUS_NOT_A_DIRECTORY;
 
-    std::lock_guard<std::mutex> lock(g_Vault->MapMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     std::wstring childPath;
     if (FileName && (FileName[0] == L'\\' || FileName[0] == L'/'))
     {
@@ -1543,6 +1689,77 @@ static NTSTATUS ApiGetDirInfoByName(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR 
     if (!NT_SUCCESS(status))
         return status;
     CopyDirInfoName(DirInfo, FileName);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ApiSetDelete(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileName, BOOLEAN DeleteFile)
+{
+    (void)FileName;
+    auto ctx = static_cast<FileContext*>(FileContext0);
+    if (!ctx)
+        return STATUS_INVALID_HANDLE;
+
+    if (!DeleteFile)
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
+        if (ctx->LogicalDeleted && !ctx->DeletedParentId.empty() && !ctx->DeletedName.empty())
+        {
+            DirectoryMap parent;
+            NTSTATUS status = DirectoryMap::Load(*g_Vault->Store, ctx->DeletedParentId, parent);
+            if (!NT_SUCCESS(status))
+                return status;
+            parent.Entries[ctx->DeletedName] = ctx->DeletedEntry;
+            status = DirectoryMap::Save(*g_Vault->Store, ctx->DeletedParentId, parent);
+            if (!NT_SUCCESS(status))
+                return status;
+            ctx->LogicalDeleted = false;
+            ctx->DeletedParentId.clear();
+            ctx->DeletedName.clear();
+        }
+        ctx->DeletePending = false;
+        return STATUS_SUCCESS;
+    }
+
+    {
+        std::wstring logicalPath = ctx->LogicalPath;
+        ResolvedPath resolved;
+        NTSTATUS status = g_Vault->Resolver->ResolvePath(logicalPath, resolved);
+        if (!NT_SUCCESS(status))
+            return status;
+        if (!resolved.Exists || resolved.Id == RootId)
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        if (resolved.Type == ObjectType::Directory)
+        {
+            DirectoryMap map;
+            status = DirectoryMap::Load(*g_Vault->Store, resolved.Id, map);
+            if (!NT_SUCCESS(status))
+                return status;
+            if (!map.Entries.empty())
+                return STATUS_DIRECTORY_NOT_EMPTY;
+        }
+
+        DirectoryMap parent;
+        status = DirectoryMap::Load(*g_Vault->Store, resolved.ParentId, parent);
+        if (!NT_SUCCESS(status))
+            return status;
+        auto it = parent.Find(resolved.Name);
+        if (it == parent.Entries.end())
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+
+        ctx->Id = resolved.Id;
+        ctx->Type = resolved.Type;
+        ctx->DeletedParentId = resolved.ParentId;
+        ctx->DeletedName = resolved.Name;
+        ctx->DeletedEntry = it->second;
+        ctx->LogicalDeleted = true;
+
+        parent.Entries.erase(it);
+        status = DirectoryMap::Save(*g_Vault->Store, resolved.ParentId, parent);
+        if (!NT_SUCCESS(status))
+            return status;
+    }
+
+    ctx->DeletePending = true;
     return STATUS_SUCCESS;
 }
 
@@ -1626,6 +1843,7 @@ int wmain(int argc, wchar_t** argv)
     iface.SetBasicInfo = ApiSetBasicInfo;
     iface.SetFileSize = ApiSetFileSize;
     iface.CanDelete = ApiCanDelete;
+    iface.SetDelete = ApiSetDelete;
     iface.Rename = ApiRename;
     iface.ReadDirectory = ApiReadDirectory;
     iface.GetDirInfoByName = ApiGetDirInfoByName;
