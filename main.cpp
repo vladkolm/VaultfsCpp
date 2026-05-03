@@ -1934,11 +1934,16 @@ int wmain(int argc, wchar_t** argv)
     params.SectorSize = 4096;
     params.SectorsPerAllocationUnit = 1;
     params.VolumeSerialNumber = 0x19831116;
+    params.FileInfoTimeout = 0;
+    params.DirInfoTimeoutValid = 1;
+    params.DirInfoTimeout = 0;
     params.CaseSensitiveSearch = 0;
     params.CasePreservedNames = 1;
     params.UnicodeOnDisk = 1;
     params.PersistentAcls = 0;
     params.PostCleanupWhenModifiedOnly = 1;
+    params.PassQueryDirectoryFileName = 1;
+    params.FlushAndPurgeOnCleanup = 1;
     wcscpy_s(params.FileSystemName, L"VaultFS2");
 
     FSP_FILE_SYSTEM_INTERFACE iface{};

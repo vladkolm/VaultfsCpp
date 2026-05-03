@@ -65,6 +65,16 @@ With the filesystem mounted, run:
 
 The script creates a temporary file on the mounted filesystem, verifies create/read/rename/delete behavior, and removes the test file before exiting.
 
+## Stress test
+
+With the filesystem mounted, run:
+
+```powershell
+.\scripts\stress-test.ps1 -MountPoint X: -BackingRoot D:\vault_backing
+```
+
+The stress test covers empty directory copy, long Unicode names, case-insensitive Unicode lookup, deep paths, binary file churn, same-directory renames, directory listing counts, cleanup, and optional plaintext scans of `.objects` and `.maps`.
+
 Unmount:
 
 ```powershell
