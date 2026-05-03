@@ -83,6 +83,50 @@ function Assert-FileBytes {
     }
 }
 
+function Assert-MemoryMappedText {
+    param(
+        [string]$Path,
+        [string]$Expected
+    )
+
+    Add-Type -AssemblyName System.IO.MemoryMappedFiles
+    $expectedBytes = [Text.Encoding]::UTF8.GetBytes($Expected)
+    Assert-True (Test-Path -LiteralPath $Path -PathType Leaf) "Missing file: $Path"
+    $length = (Get-Item -LiteralPath $Path).Length
+    if ($length -ne $expectedBytes.Length) {
+        throw "Memory-map length mismatch for $Path. Expected $($expectedBytes.Length), got $length"
+    }
+    if ($length -eq 0) {
+        return
+    }
+
+    $mapName = "vaultfs-stress-map-" + [Guid]::NewGuid().ToString("N")
+    $mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateFromFile(
+        $Path,
+        [IO.FileMode]::Open,
+        $mapName,
+        $length,
+        [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+    try {
+        $view = $mmf.CreateViewAccessor(0, $length, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+        try {
+            $actualBytes = [byte[]]::new([int]$length)
+            $view.ReadArray(0, $actualBytes, 0, $actualBytes.Length) | Out-Null
+            for ($i = 0; $i -lt $actualBytes.Length; $i++) {
+                if ($actualBytes[$i] -ne $expectedBytes[$i]) {
+                    throw "Memory-map byte mismatch for $Path at offset $i"
+                }
+            }
+        }
+        finally {
+            $view.Dispose()
+        }
+    }
+    finally {
+        $mmf.Dispose()
+    }
+}
+
 function Get-BackingFiles {
     param([string]$Root)
 
@@ -162,6 +206,7 @@ try {
     Assert-FileText -Path $longPath -Expected $longText
     $upperLongPath = Join-Path $root ($longName.ToUpperInvariant())
     Assert-True (Test-Path -LiteralPath $upperLongPath -PathType Leaf) "Uppercase Unicode lookup failed"
+    Assert-MemoryMappedText -Path $longPath -Expected $longText
 
     Write-Host "3. Deep path create/read/rename/delete"
     $deep = $root

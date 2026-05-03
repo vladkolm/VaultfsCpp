@@ -904,10 +904,12 @@ struct FileContext
 struct VaultContext
 {
     std::wstring BackingRoot;
+    std::wstring TracePath;
     std::unique_ptr<ObjectStore> Store;
     std::unique_ptr<PathResolver> Resolver;
     std::array<BYTE, 32> MasterKey{};
     std::recursive_mutex MapMutex;
+    std::mutex TraceMutex;
     std::set<FileContext*> LiveContexts;
     std::vector<std::unique_ptr<FileContext>> RetiredContexts;
     FSP_FILE_SYSTEM* FileSystem = nullptr;
@@ -916,6 +918,91 @@ struct VaultContext
 static VaultContext* g_Vault = nullptr;
 
 static HANDLE g_StopEvent = nullptr;
+
+static std::wstring CurrentProcessImageName(UINT32 pid)
+{
+    if (!pid)
+        return L"";
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+        return L"";
+
+    wchar_t path[MAX_PATH]{};
+    DWORD size = static_cast<DWORD>(_countof(path));
+    std::wstring name;
+    if (QueryFullProcessImageNameW(process, 0, path, &size))
+    {
+        name.assign(path, size);
+        size_t slash = name.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+            name.erase(0, slash + 1);
+    }
+    CloseHandle(process);
+    return name;
+}
+
+static std::string Hex32(UINT32 value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    std::string out(8, '0');
+    for (int i = 7; i >= 0; --i)
+    {
+        out[i] = hex[value & 0xf];
+        value >>= 4;
+    }
+    return out;
+}
+
+static void TraceEvent(const char* operation, const std::wstring& path, const std::string& detail)
+{
+    if (!g_Vault || g_Vault->TracePath.empty())
+        return;
+
+    UINT32 pid = 0;
+    try
+    {
+        pid = FspFileSystemOperationProcessId();
+    }
+    catch (...)
+    {
+        pid = 0;
+    }
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+
+    std::ostringstream line;
+    line << now.wYear << '-';
+    if (now.wMonth < 10) line << '0';
+    line << now.wMonth << '-';
+    if (now.wDay < 10) line << '0';
+    line << now.wDay << ' ';
+    if (now.wHour < 10) line << '0';
+    line << now.wHour << ':';
+    if (now.wMinute < 10) line << '0';
+    line << now.wMinute << ':';
+    if (now.wSecond < 10) line << '0';
+    line << now.wSecond << '.';
+    if (now.wMilliseconds < 100) line << '0';
+    if (now.wMilliseconds < 10) line << '0';
+    line << now.wMilliseconds;
+    line << " pid=" << pid;
+    std::wstring image = CurrentProcessImageName(pid);
+    if (!image.empty())
+        line << " proc=" << WideToUtf8(image);
+    line << " op=" << operation;
+    if (!path.empty())
+        line << " path=" << WideToUtf8(path);
+    if (!detail.empty())
+        line << ' ' << detail;
+    line << "\r\n";
+
+    std::lock_guard<std::mutex> lock(g_Vault->TraceMutex);
+    std::ofstream out(g_Vault->TracePath, std::ios::binary | std::ios::app);
+    if (out)
+        out << line.str();
+}
 
 static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType)
 {
@@ -1120,14 +1207,21 @@ static NTSTATUS ApiGetSecurityByName(FSP_FILE_SYSTEM*, PWSTR FileName, PUINT32 P
     ResolvedPath resolved;
     NTSTATUS status = g_Vault->Resolver->ResolvePath(logicalPath, resolved);
     if (!NT_SUCCESS(status))
+    {
+        TraceEvent("GetSecurityByName", logicalPath, "status=0x" + Hex32(static_cast<UINT32>(status)));
         return status;
+    }
     if (!resolved.Exists)
     {
         std::wstring parentId;
         std::wstring name;
         status = g_Vault->Resolver->ResolveParent(logicalPath, parentId, name);
         if (!NT_SUCCESS(status))
+        {
+            TraceEvent("GetSecurityByName", logicalPath, "status=0x" + Hex32(static_cast<UINT32>(status)) + " exists=0");
             return status;
+        }
+        TraceEvent("GetSecurityByName", logicalPath, "status=0xC0000034 exists=0");
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     if (PFileAttributes)
@@ -1135,12 +1229,17 @@ static NTSTATUS ApiGetSecurityByName(FSP_FILE_SYSTEM*, PWSTR FileName, PUINT32 P
     if (PSecurityDescriptorSize)
         *PSecurityDescriptorSize = 0;
     (void)SecurityDescriptor;
+    std::ostringstream detail;
+    detail << "status=0x00000000 exists=1 type=" << (resolved.Type == ObjectType::Directory ? "dir" : "file")
+        << " size=" << resolved.Entry.FileSize;
+    TraceEvent("GetSecurityByName", logicalPath, detail.str());
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS ApiCreate(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess, UINT32 FileAttributes, PSECURITY_DESCRIPTOR, UINT64 AllocationSize, PVOID* PFileContext, FSP_FSCTL_FILE_INFO* FileInfo)
 {
     std::wstring logicalPath = FileName ? FileName : L"";
+    (void)GrantedAccess;
 
     std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     bool isDirectory = 0 != (CreateOptions & FILE_DIRECTORY_FILE);
@@ -1195,7 +1294,7 @@ static NTSTATUS ApiCreate(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions
 
     if (!isDirectory)
     {
-        ctx->Handle = CreateFileW(g_Vault->Store->ExistingDataPath(id).c_str(), GrantedAccess, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ctx->Handle = CreateFileW(g_Vault->Store->ExistingDataPath(id).c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (ctx->Handle == INVALID_HANDLE_VALUE)
         {
             status = Win32ToNtStatus(GetLastError());
@@ -1226,14 +1325,26 @@ static NTSTATUS ApiCreate(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions
 static NTSTATUS ApiOpen(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess, PVOID* PFileContext, FSP_FSCTL_FILE_INFO* FileInfo)
 {
     std::wstring logicalPath = FileName ? FileName : L"";
+    (void)GrantedAccess;
 
     std::lock_guard<std::recursive_mutex> lock(g_Vault->MapMutex);
     ResolvedPath resolved;
     NTSTATUS status = g_Vault->Resolver->ResolvePath(logicalPath, resolved);
     if (!NT_SUCCESS(status))
+    {
+        std::ostringstream detail;
+        detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+            << " createOptions=0x" << Hex32(CreateOptions);
+        TraceEvent("Open", logicalPath, detail.str());
         return status;
+    }
     if (!resolved.Exists)
+    {
+        std::ostringstream detail;
+        detail << "status=0xC0000034 exists=0 createOptions=0x" << Hex32(CreateOptions);
+        TraceEvent("Open", logicalPath, detail.str());
         return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
 
     auto ctx = std::make_unique<FileContext>();
     ctx->Id = resolved.Id;
@@ -1246,10 +1357,16 @@ static NTSTATUS ApiOpen(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, 
     if (resolved.Type == ObjectType::File)
     {
         DWORD flags = (CreateOptions & FILE_DELETE_ON_CLOSE) ? FILE_FLAG_DELETE_ON_CLOSE : FILE_ATTRIBUTE_NORMAL;
-        ctx->Handle = CreateFileW(g_Vault->Store->ExistingDataPath(resolved.Id).c_str(), GrantedAccess, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, flags, nullptr);
+        ctx->Handle = CreateFileW(g_Vault->Store->ExistingDataPath(resolved.Id).c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, flags, nullptr);
         if (ctx->Handle == INVALID_HANDLE_VALUE)
         {
             status = Win32ToNtStatus(GetLastError());
+            std::ostringstream detail;
+            detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+                << " backing-open-failed win32=" << GetLastError()
+                << " logicalSize=" << ctx->LogicalSize
+                << " createOptions=0x" << Hex32(CreateOptions);
+            TraceEvent("Open", logicalPath, detail.str());
             return status;
         }
     }
@@ -1258,6 +1375,14 @@ static NTSTATUS ApiOpen(FSP_FILE_SYSTEM*, PWSTR FileName, UINT32 CreateOptions, 
     g_Vault->LiveContexts.insert(rawCtx);
     *PFileContext = rawCtx;
     status = GetObjectInfo(resolved, FileInfo);
+    std::ostringstream detail;
+    detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+        << " type=" << (resolved.Type == ObjectType::Directory ? "dir" : "file")
+        << " logicalSize=" << rawCtx->LogicalSize
+        << " fileInfoSize=" << (FileInfo ? FileInfo->FileSize : 0)
+        << " alloc=" << (FileInfo ? FileInfo->AllocationSize : 0)
+        << " createOptions=0x" << Hex32(CreateOptions);
+    TraceEvent("Open", logicalPath, detail.str());
     return status;
 }
 
@@ -1351,32 +1476,187 @@ static NTSTATUS ApiRead(FSP_FILE_SYSTEM*, PVOID FileContext0, PVOID Buffer, UINT
 {
     auto ctx = static_cast<FileContext*>(FileContext0);
     if (!ctx || ctx->Type != ObjectType::File)
+    {
+        TraceEvent("Read", ctx ? ctx->LogicalPath : L"", "status=0xC0000008 invalid-context");
         return STATUS_INVALID_HANDLE;
+    }
     if (ctx->Handle == INVALID_HANDLE_VALUE)
     {
-        *PBytesTransferred = 0;
+        HANDLE reopened = CreateFileW(g_Vault->Store->ExistingDataPath(ctx->Id).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (reopened == INVALID_HANDLE_VALUE)
+        {
+            NTSTATUS status = Win32ToNtStatus(GetLastError());
+            *PBytesTransferred = 0;
+            std::ostringstream detail;
+            detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+                << " reopen-failed offset=" << Offset
+                << " requested=" << Length
+                << " returned=0 logicalSize=" << ctx->LogicalSize;
+            TraceEvent("Read", ctx->LogicalPath, detail.str());
+            return status;
+        }
+
+        LARGE_INTEGER li{};
+        li.QuadPart = static_cast<LONGLONG>(Offset);
+        ULONG requestedLength = Length;
+        if (Offset >= ctx->LogicalSize)
+        {
+            CloseHandle(reopened);
+            *PBytesTransferred = 0;
+            std::ostringstream detail;
+            detail << "status=0x00000000 reopened eof offset=" << Offset
+                << " requested=" << requestedLength << " returned=0 logicalSize=" << ctx->LogicalSize;
+            TraceEvent("Read", ctx->LogicalPath, detail.str());
+            return STATUS_SUCCESS;
+        }
+        if (Offset + Length > ctx->LogicalSize)
+            Length = static_cast<ULONG>(ctx->LogicalSize - Offset);
+        if (!SetFilePointerEx(reopened, li, nullptr, FILE_BEGIN))
+        {
+            NTSTATUS status = Win32ToNtStatus(GetLastError());
+            CloseHandle(reopened);
+            *PBytesTransferred = 0;
+            std::ostringstream detail;
+            detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+                << " reopened set-pointer-failed offset=" << Offset
+                << " requested=" << requestedLength
+                << " clipped=" << Length
+                << " logicalSize=" << ctx->LogicalSize;
+            TraceEvent("Read", ctx->LogicalPath, detail.str());
+            return status;
+        }
+
+        DWORD read = 0;
+        if (!ReadFile(reopened, Buffer, Length, &read, nullptr))
+        {
+            NTSTATUS status = Win32ToNtStatus(GetLastError());
+            CloseHandle(reopened);
+            *PBytesTransferred = 0;
+            std::ostringstream detail;
+            detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+                << " reopened backing-read-failed offset=" << Offset
+                << " requested=" << requestedLength
+                << " clipped=" << Length
+                << " returned=" << read
+                << " logicalSize=" << ctx->LogicalSize;
+            TraceEvent("Read", ctx->LogicalPath, detail.str());
+            return status;
+        }
+        CloseHandle(reopened);
+
+        NTSTATUS status = ApplyContentCipher(g_Vault->MasterKey, ctx->Id, Offset, static_cast<BYTE*>(Buffer), read);
+        if (!NT_SUCCESS(status))
+        {
+            *PBytesTransferred = 0;
+            std::ostringstream detail;
+            detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+                << " reopened decrypt-failed offset=" << Offset
+                << " requested=" << requestedLength
+                << " clipped=" << Length
+                << " returned=" << read
+                << " logicalSize=" << ctx->LogicalSize;
+            TraceEvent("Read", ctx->LogicalPath, detail.str());
+            return status;
+        }
+        *PBytesTransferred = read;
+        std::ostringstream detail;
+        detail << "status=0x00000000 reopened offset=" << Offset
+            << " requested=" << requestedLength
+            << " clipped=" << Length
+            << " returned=" << read
+            << " logicalSize=" << ctx->LogicalSize;
+        if (read > 0)
+        {
+            BYTE* bytes = static_cast<BYTE*>(Buffer);
+            detail << " firstBytes=";
+            ULONG sample = std::min<ULONG>(read, 16);
+            static const char hex[] = "0123456789ABCDEF";
+            for (ULONG i = 0; i < sample; ++i)
+            {
+                if (i)
+                    detail << '-';
+                detail << hex[(bytes[i] >> 4) & 0xf] << hex[bytes[i] & 0xf];
+            }
+        }
+        TraceEvent("Read", ctx->LogicalPath, detail.str());
         return STATUS_SUCCESS;
     }
     if (Offset >= ctx->LogicalSize)
     {
         *PBytesTransferred = 0;
+        std::ostringstream detail;
+        detail << "status=0x00000000 eof offset=" << Offset
+            << " requested=" << Length << " returned=0 logicalSize=" << ctx->LogicalSize;
+        TraceEvent("Read", ctx->LogicalPath, detail.str());
         return STATUS_SUCCESS;
     }
+    ULONG requestedLength = Length;
     if (Offset + Length > ctx->LogicalSize)
         Length = static_cast<ULONG>(ctx->LogicalSize - Offset);
 
     LARGE_INTEGER li{};
     li.QuadPart = static_cast<LONGLONG>(Offset);
     if (!SetFilePointerEx(ctx->Handle, li, nullptr, FILE_BEGIN))
-        return Win32ToNtStatus(GetLastError());
+    {
+        NTSTATUS status = Win32ToNtStatus(GetLastError());
+        std::ostringstream detail;
+        detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+            << " set-pointer-failed offset=" << Offset
+            << " requested=" << requestedLength
+            << " clipped=" << Length
+            << " logicalSize=" << ctx->LogicalSize;
+        TraceEvent("Read", ctx->LogicalPath, detail.str());
+        return status;
+    }
 
     DWORD read = 0;
     if (!ReadFile(ctx->Handle, Buffer, Length, &read, nullptr))
-        return Win32ToNtStatus(GetLastError());
+    {
+        NTSTATUS status = Win32ToNtStatus(GetLastError());
+        std::ostringstream detail;
+        detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+            << " backing-read-failed offset=" << Offset
+            << " requested=" << requestedLength
+            << " clipped=" << Length
+            << " returned=" << read
+            << " logicalSize=" << ctx->LogicalSize;
+        TraceEvent("Read", ctx->LogicalPath, detail.str());
+        return status;
+    }
     NTSTATUS status = ApplyContentCipher(g_Vault->MasterKey, ctx->Id, Offset, static_cast<BYTE*>(Buffer), read);
     if (!NT_SUCCESS(status))
+    {
+        std::ostringstream detail;
+        detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+            << " decrypt-failed offset=" << Offset
+            << " requested=" << requestedLength
+            << " clipped=" << Length
+            << " returned=" << read
+            << " logicalSize=" << ctx->LogicalSize;
+        TraceEvent("Read", ctx->LogicalPath, detail.str());
         return status;
+    }
     *PBytesTransferred = read;
+    std::ostringstream detail;
+    detail << "status=0x00000000 offset=" << Offset
+        << " requested=" << requestedLength
+        << " clipped=" << Length
+        << " returned=" << read
+        << " logicalSize=" << ctx->LogicalSize;
+    if (read > 0)
+    {
+        BYTE* bytes = static_cast<BYTE*>(Buffer);
+        detail << " firstBytes=";
+        ULONG sample = std::min<ULONG>(read, 16);
+        static const char hex[] = "0123456789ABCDEF";
+        for (ULONG i = 0; i < sample; ++i)
+        {
+            if (i)
+                detail << '-';
+            detail << hex[(bytes[i] >> 4) & 0xf] << hex[bytes[i] & 0xf];
+        }
+    }
+    TraceEvent("Read", ctx->LogicalPath, detail.str());
     return STATUS_SUCCESS;
 }
 
@@ -1435,7 +1715,10 @@ static NTSTATUS ApiGetFileInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, FSP_FSCTL_F
 {
     auto ctx = static_cast<FileContext*>(FileContext0);
     if (!ctx)
+    {
+        TraceEvent("GetFileInfo", L"", "status=0xC0000008 invalid-context");
         return STATUS_INVALID_HANDLE;
+    }
 
     if (ctx->LogicalDeleted)
     {
@@ -1448,6 +1731,12 @@ static NTSTATUS ApiGetFileInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, FSP_FSCTL_F
         }
         std::hash<std::wstring> hash;
         FileInfo->IndexNumber = static_cast<UINT64>(hash(ctx->Id));
+        std::ostringstream detail;
+        detail << "status=0x00000000 deleted=1 type=" << (ctx->Type == ObjectType::Directory ? "dir" : "file")
+            << " ctxLogicalSize=" << ctx->LogicalSize
+            << " fileInfoSize=" << FileInfo->FileSize
+            << " alloc=" << FileInfo->AllocationSize;
+        TraceEvent("GetFileInfo", ctx->LogicalPath, detail.str());
         return STATUS_SUCCESS;
     }
 
@@ -1466,6 +1755,13 @@ static NTSTATUS ApiGetFileInfo(FSP_FILE_SYSTEM*, PVOID FileContext0, FSP_FSCTL_F
     {
         status = GetFileInfoByHandle(ctx->Handle, ctx->Id, ctx->Type, FileInfo, ctx->LogicalSize);
     }
+    std::ostringstream detail;
+    detail << "status=0x" << Hex32(static_cast<UINT32>(status))
+        << " type=" << (ctx->Type == ObjectType::Directory ? "dir" : "file")
+        << " ctxLogicalSize=" << ctx->LogicalSize
+        << " fileInfoSize=" << (FileInfo ? FileInfo->FileSize : 0)
+        << " alloc=" << (FileInfo ? FileInfo->AllocationSize : 0);
+    TraceEvent("GetFileInfo", ctx->LogicalPath, detail.str());
     return status;
 }
 
@@ -1906,6 +2202,13 @@ int wmain(int argc, wchar_t** argv)
     }
     g_MasterKey = vault.MasterKey;
     g_MasterKeyReady = true;
+
+    wchar_t* traceEnv = nullptr;
+    size_t traceEnvLength = 0;
+    if (0 == _wdupenv_s(&traceEnv, &traceEnvLength, L"VAULTFS_TRACE") && traceEnv && traceEnv[0] != L'\0')
+        vault.TracePath = traceEnv;
+    if (traceEnv)
+        free(traceEnv);
 
     vault.Store = std::make_unique<ObjectStore>(vault.BackingRoot);
     vault.Store->Initialize();
