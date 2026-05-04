@@ -53,6 +53,12 @@ $env:VAULTFS_KEY = "change this development key"
 .\x64\Release\VaultFs.exe D:\vault_backing X:
 ```
 
+For plaintext development/debugging storage, omit `VAULTFS_KEY` and pass `--NoEncryption`:
+
+```powershell
+.\x64\Release\VaultFs.exe --NoEncryption D:\vault_backing X:
+```
+
 Now `X:` should show the contents of `D:\vault_backing`.
 
 ## Smoke test
@@ -96,6 +102,8 @@ or press Ctrl+C in the console.
 Set `VAULTFS_KEY` before mounting. The prototype derives a SHA-256 key from this value and uses a SHA-256 based random-access keystream per object ID and byte offset.
 
 This protects file object contents in `.objects`, directory metadata contents in `.maps`, logical names, entry IDs, entry types, logical size/timestamp/attribute metadata, and physical map/object filenames from appearing as plaintext. Existing plaintext map files can still be read and are rewritten encrypted under keyed names when modified.
+
+`--NoEncryption` disables content encryption, map encryption, and keyed physical labels. It is intended only for development/debugging and writes plaintext `.data` object contents plus plaintext JSON `.map` files under legacy object/map names.
 
 The current file-per-object design still leaks metadata that NTFS itself observes: object count, 4096-byte physical size buckets, backing-file timestamps, and access patterns. Hiding those further requires stronger padding, timestamp normalization, batched writes, or a container format. File/map contents are also not authenticated yet.
 

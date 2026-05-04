@@ -303,8 +303,12 @@ static void AppendUInt64Le(std::vector<BYTE>& out, UINT64 value)
         out.push_back(static_cast<BYTE>((value >> (i * 8)) & 0xff));
 }
 
+static bool g_MasterKeyReady = false;
+
 static NTSTATUS ApplyContentCipher(const std::array<BYTE, 32>& key, const std::wstring& id, UINT64 offset, BYTE* data, ULONG length)
 {
+    if (!g_MasterKeyReady)
+        return STATUS_SUCCESS;
     if (length == 0)
         return STATUS_SUCCESS;
 
@@ -338,7 +342,6 @@ static NTSTATUS ApplyContentCipher(const std::array<BYTE, 32>& key, const std::w
 }
 
 static std::array<BYTE, 32> g_MasterKey{};
-static bool g_MasterKeyReady = false;
 
 static constexpr BYTE EncryptedMapMagic[] = { 'V', 'F', 'S', 'M', 'A', 'P', '2', 0 };
 
@@ -2174,34 +2177,65 @@ static NTSTATUS ApiSetDelete(FSP_FILE_SYSTEM*, PVOID FileContext0, PWSTR FileNam
 
 int wmain(int argc, wchar_t** argv)
 {
-    if (argc != 3)
+    bool noEncryption = false;
+    std::vector<std::wstring> positional;
+    for (int i = 1; i < argc; ++i)
     {
-        fwprintf(stderr, L"Usage: %s <backing-directory> <mount-point>\n", argv[0]);
+        if (CaseInsensitiveEquals(argv[i], L"--NoEncryption"))
+        {
+            noEncryption = true;
+        }
+        else if (argv[i] && argv[i][0] == L'-')
+        {
+            fwprintf(stderr, L"Unknown option: %s\n", argv[i]);
+            fwprintf(stderr, L"Usage: %s [--NoEncryption] <backing-directory> <mount-point>\n", argv[0]);
+            fwprintf(stderr, L"Example: %s D:\\vault_backing X:\n", argv[0]);
+            fwprintf(stderr, L"Example: %s --NoEncryption D:\\vault_backing X:\n", argv[0]);
+            return 2;
+        }
+        else
+        {
+            positional.push_back(argv[i] ? argv[i] : L"");
+        }
+    }
+
+    if (positional.size() != 2)
+    {
+        fwprintf(stderr, L"Usage: %s [--NoEncryption] <backing-directory> <mount-point>\n", argv[0]);
         fwprintf(stderr, L"Example: %s D:\\vault_backing X:\n", argv[0]);
+        fwprintf(stderr, L"Example: %s --NoEncryption D:\\vault_backing X:\n", argv[0]);
         return 2;
     }
 
     VaultContext vault{};
-    vault.BackingRoot = TrimTrailingSlash(argv[1]);
-    wchar_t* keyEnv = nullptr;
-    size_t keyEnvLength = 0;
-    errno_t keyEnvError = _wdupenv_s(&keyEnv, &keyEnvLength, L"VAULTFS_KEY");
-    if (keyEnvError != 0 || !keyEnv || keyEnv[0] == L'\0')
+    vault.BackingRoot = TrimTrailingSlash(positional[0]);
+    if (noEncryption)
     {
-        if (keyEnv)
-            free(keyEnv);
-        fwprintf(stderr, L"VAULTFS_KEY must be set for Phase 2 content encryption.\n");
-        return 2;
+        g_MasterKey = {};
+        g_MasterKeyReady = false;
     }
-    NTSTATUS keyStatus = DeriveMasterKey(keyEnv, vault.MasterKey);
-    free(keyEnv);
-    if (!NT_SUCCESS(keyStatus))
+    else
     {
-        fwprintf(stderr, L"Failed to derive encryption key: 0x%08X\n", keyStatus);
-        return 1;
+        wchar_t* keyEnv = nullptr;
+        size_t keyEnvLength = 0;
+        errno_t keyEnvError = _wdupenv_s(&keyEnv, &keyEnvLength, L"VAULTFS_KEY");
+        if (keyEnvError != 0 || !keyEnv || keyEnv[0] == L'\0')
+        {
+            if (keyEnv)
+                free(keyEnv);
+            fwprintf(stderr, L"VAULTFS_KEY must be set unless --NoEncryption is used.\n");
+            return 2;
+        }
+        NTSTATUS keyStatus = DeriveMasterKey(keyEnv, vault.MasterKey);
+        free(keyEnv);
+        if (!NT_SUCCESS(keyStatus))
+        {
+            fwprintf(stderr, L"Failed to derive encryption key: 0x%08X\n", keyStatus);
+            return 1;
+        }
+        g_MasterKey = vault.MasterKey;
+        g_MasterKeyReady = true;
     }
-    g_MasterKey = vault.MasterKey;
-    g_MasterKeyReady = true;
 
     wchar_t* traceEnv = nullptr;
     size_t traceEnvLength = 0;
@@ -2280,7 +2314,7 @@ int wmain(int argc, wchar_t** argv)
     }
 
     vault.FileSystem->UserContext = &vault;
-    status = FspFileSystemSetMountPoint(vault.FileSystem, argv[2]);
+    status = FspFileSystemSetMountPoint(vault.FileSystem, const_cast<PWSTR>(positional[1].c_str()));
     if (!NT_SUCCESS(status))
     {
         fwprintf(stderr, L"FspFileSystemSetMountPoint failed: 0x%08X\n", status);
@@ -2302,7 +2336,10 @@ int wmain(int argc, wchar_t** argv)
         return 1;
     }
 
-    wprintf(L"Mounted %s at %s using short object IDs. Press Ctrl-C to stop.\n", vault.BackingRoot.c_str(), argv[2]);
+    wprintf(L"Mounted %s at %s using short object IDs (%s). Press Ctrl-C to stop.\n",
+        vault.BackingRoot.c_str(),
+        positional[1].c_str(),
+        noEncryption ? L"no encryption" : L"encrypted");
     WaitForSingleObject(g_StopEvent, INFINITE);
 
     FspFileSystemStopDispatcher(vault.FileSystem);
