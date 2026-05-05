@@ -8,6 +8,7 @@ typedef long NTSTATUS, *PNTSTATUS;
 #include <winfsp/winfsp.h>
 #include <bcrypt.h>
 #include "Data.h"
+#include "JsonUtils.h"
 #include "ObjectStore.h"
 #include "DirectoryMap.h"
 #include "PathResolver.h"
@@ -62,54 +63,6 @@ static std::string WideToUtf8(const std::wstring& value)
     std::string out(bytes, '\0');
     WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), &out[0], bytes, nullptr, nullptr);
     return out;
-}
-
-static std::wstring Utf8ToWide(const std::string& value)
-{
-    if (value.empty())
-        return {};
-    int chars = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
-    std::wstring out(chars, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), &out[0], chars);
-    return out;
-}
-
-static std::string JsonEscape(const std::wstring& value)
-{
-    std::string utf8 = WideToUtf8(value);
-    std::string out;
-    for (char ch : utf8)
-    {
-        switch (ch)
-        {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default: out += ch; break;
-        }
-    }
-    return out;
-}
-
-static std::wstring JsonUnescapeToWide(const std::string& value)
-{
-    std::string out;
-    for (size_t i = 0; i < value.size(); ++i)
-    {
-        if (value[i] == '\\' && i + 1 < value.size())
-        {
-            char n = value[++i];
-            if (n == 'n') out += '\n';
-            else if (n == 'r') out += '\r';
-            else if (n == 't') out += '\t';
-            else out += n;
-        }
-        else
-            out += value[i];
-    }
-    return Utf8ToWide(out);
 }
 
 static std::vector<std::wstring> SplitLogicalPath(const std::wstring& path)
@@ -351,6 +304,10 @@ static std::wstring DeriveStorageLabel(const std::wstring& purpose, const std::w
 
 // ObjectStore uses the internal encryption/path helpers above.
 #include "ObjectStore.cpp"
+
+
+// JsonUtils is consumed by DirectoryMap in this unity-style build.
+#include "JsonUtils.cpp"
 
 
 // DirectoryMap uses the internal JSON/encryption helpers above.

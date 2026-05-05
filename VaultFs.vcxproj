@@ -85,10 +85,12 @@
     <ClInclude Include="Data.h" />
     <ClInclude Include="DirectoryMap.h" />
     <ClInclude Include="FileOperation.h" />
+    <ClInclude Include="JsonUtils.h" />
     <ClInclude Include="ObjectStore.h" />
     <ClInclude Include="PathResolver.h" />
     <None Include="DirectoryMap.cpp" />
     <None Include="FileOperation.cpp" />
+    <None Include="JsonUtils.cpp" />
     <None Include="ObjectStore.cpp" />
     <None Include="PathResolver.cpp" />
   </ItemGroup>

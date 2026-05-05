@@ -1,5 +1,7 @@
 #include "DirectoryMap.h"
 
+#include "JsonUtils.h"
+
 #include <algorithm>
 #include <cstring>
 #include <fstream>
