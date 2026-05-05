@@ -1,6 +1,7 @@
 #include "PathResolver.h"
 
 #include "DirectoryMap.h"
+#include "Utilities.h"
 
 PathResolver::PathResolver(const ObjectStore& store) : store_(store)
 {

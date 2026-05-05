@@ -1,5 +1,7 @@
 #include "FileOperation.h"
 
+#include "Utilities.h"
+
 NTSTATUS FileOperation::GetVolumeInfo(FSP_FILE_SYSTEM*, FSP_FSCTL_VOLUME_INFO* VolumeInfo)
 {
     memset(VolumeInfo, 0, sizeof(*VolumeInfo));

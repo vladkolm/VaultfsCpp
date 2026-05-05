@@ -88,11 +88,13 @@
     <ClInclude Include="JsonUtils.h" />
     <ClInclude Include="ObjectStore.h" />
     <ClInclude Include="PathResolver.h" />
+    <ClInclude Include="Utilities.h" />
     <None Include="DirectoryMap.cpp" />
     <None Include="FileOperation.cpp" />
     <None Include="JsonUtils.cpp" />
     <None Include="ObjectStore.cpp" />
     <None Include="PathResolver.cpp" />
+    <None Include="Utilities.cpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
