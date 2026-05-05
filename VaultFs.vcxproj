@@ -83,8 +83,10 @@
 
   <ItemGroup>
     <ClInclude Include="Data.h" />
+    <ClInclude Include="DirectoryMap.h" />
     <ClInclude Include="FileOperation.h" />
     <ClInclude Include="ObjectStore.h" />
+    <None Include="DirectoryMap.cpp" />
     <None Include="FileOperation.cpp" />
     <None Include="ObjectStore.cpp" />
   </ItemGroup>
