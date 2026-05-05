@@ -7,6 +7,7 @@
 typedef long NTSTATUS, *PNTSTATUS;
 #include <winfsp/winfsp.h>
 #include <bcrypt.h>
+#include "Data.h"
 #include "FileOperation.h"
 
 #include <array>
@@ -24,34 +25,6 @@ typedef long NTSTATUS, *PNTSTATUS;
 #include <sstream>
 #include <string>
 #include <vector>
-
-enum class ObjectType
-{
-    File,
-    Directory
-};
-
-struct MapEntry
-{
-    std::wstring Id;
-    ObjectType Type = ObjectType::File;
-    UINT64 FileSize = 0;
-    UINT64 CreationTime = 0;
-    UINT64 LastAccessTime = 0;
-    UINT64 LastWriteTime = 0;
-    UINT64 ChangeTime = 0;
-    UINT32 FileAttributes = FILE_ATTRIBUTE_NORMAL;
-};
-
-struct ResolvedPath
-{
-    bool Exists = false;
-    std::wstring Id;
-    ObjectType Type = ObjectType::Directory;
-    std::wstring ParentId;
-    std::wstring Name;
-    MapEntry Entry;
-};
 
 static constexpr wchar_t RootId[] = L"root";
 static wchar_t DiskDeviceName[] = L"WinFsp.Disk";

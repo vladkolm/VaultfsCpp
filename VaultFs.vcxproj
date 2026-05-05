@@ -82,6 +82,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ClInclude Include="Data.h" />
     <ClInclude Include="FileOperation.h" />
     <None Include="FileOperation.cpp" />
   </ItemGroup>
