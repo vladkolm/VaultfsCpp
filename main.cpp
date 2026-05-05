@@ -193,37 +193,6 @@ static std::wstring DeriveStorageLabel(const std::wstring& purpose, const std::w
 // PathResolver uses the internal path helpers above.
 #include "PathResolver.cpp"
 
-struct FileContext
-{
-    HANDLE Handle = INVALID_HANDLE_VALUE;
-    std::wstring Id;
-    ObjectType Type = ObjectType::File;
-    std::wstring LogicalPath;
-    std::wstring ParentId;
-    std::wstring Name;
-    UINT64 LogicalSize = 0;
-    bool DeletePending = false;
-    bool LogicalDeleted = false;
-    bool PhysicalDeleted = false;
-    std::wstring DeletedParentId;
-    std::wstring DeletedName;
-    MapEntry DeletedEntry;
-};
-
-struct VaultContext
-{
-    std::wstring BackingRoot;
-    std::wstring TracePath;
-    std::unique_ptr<ObjectStore> Store;
-    std::unique_ptr<PathResolver> Resolver;
-    std::array<BYTE, 32> MasterKey{};
-    std::recursive_mutex MapMutex;
-    std::mutex TraceMutex;
-    std::set<FileContext*> LiveContexts;
-    std::vector<std::unique_ptr<FileContext>> RetiredContexts;
-    FSP_FILE_SYSTEM* FileSystem = nullptr;
-};
-
 static VaultContext* g_Vault = nullptr;
 
 static HANDLE g_StopEvent = nullptr;
