@@ -19,6 +19,9 @@ typedef long NTSTATUS, *PNTSTATUS;
 class ObjectStore;
 class PathResolver;
 
+extern const wchar_t RootId[];
+extern const UINT64 PhysicalSizeQuantum;
+
 enum class ObjectType
 {
     File,
@@ -77,3 +80,6 @@ struct VaultContext
     std::vector<std::unique_ptr<FileContext>> RetiredContexts;
     FSP_FILE_SYSTEM* FileSystem = nullptr;
 };
+
+extern VaultContext* g_Vault;
+extern HANDLE g_StopEvent;

@@ -32,43 +32,12 @@ typedef long NTSTATUS, *PNTSTATUS;
 #include <string>
 #include <vector>
 
-static constexpr wchar_t RootId[] = L"root";
 static wchar_t DiskDeviceName[] = L"WinFsp.Disk";
-static constexpr UINT64 PhysicalSizeQuantum = 4096;
 
-
-// EncryptionUtilities are consumed by the extracted implementation files below.
-#include "EncryptionUtilities.cpp"
-
-// Utilities are consumed by the extracted implementation files below.
-#include "Utilities.cpp"
-
-
-// ObjectStore uses the internal encryption/path helpers above.
-#include "ObjectStore.cpp"
-
-
-// JsonUtils is consumed by DirectoryMap in this unity-style build.
-#include "JsonUtils.cpp"
-
-
-// DirectoryMap uses the internal JSON/encryption helpers above.
-#include "DirectoryMap.cpp"
-
-
-// PathResolver uses the internal path helpers above.
-#include "PathResolver.cpp"
-
-static VaultContext* g_Vault = nullptr;
-
-static HANDLE g_StopEvent = nullptr;
-
-
-// WindowsUtilities use the runtime globals above and are consumed by FileOperation.
-#include "WindowsUtilities.cpp"
-
-// FileOperation uses the internal store/map/resolver types above.
-#include "FileOperation.cpp"
+const wchar_t RootId[] = L"root";
+const UINT64 PhysicalSizeQuantum = 4096;
+VaultContext* g_Vault = nullptr;
+HANDLE g_StopEvent = nullptr;
 
 int wmain(int argc, wchar_t** argv)
 {

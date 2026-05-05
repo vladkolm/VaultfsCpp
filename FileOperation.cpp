@@ -1,8 +1,17 @@
 #include "FileOperation.h"
 
+#include "DirectoryMap.h"
 #include "EncryptionUtilities.h"
+#include "ObjectStore.h"
+#include "PathResolver.h"
 #include "Utilities.h"
 #include "WindowsUtilities.h"
+
+#include <algorithm>
+#include <cstring>
+#include <mutex>
+#include <sstream>
+#include <vector>
 
 NTSTATUS FileOperation::GetVolumeInfo(FSP_FILE_SYSTEM*, FSP_FSCTL_VOLUME_INFO* VolumeInfo)
 {

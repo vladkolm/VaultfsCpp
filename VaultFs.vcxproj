@@ -78,7 +78,15 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
+    <ClCompile Include="DirectoryMap.cpp" />
+    <ClCompile Include="EncryptionUtilities.cpp" />
+    <ClCompile Include="FileOperation.cpp" />
+    <ClCompile Include="JsonUtils.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="ObjectStore.cpp" />
+    <ClCompile Include="PathResolver.cpp" />
+    <ClCompile Include="Utilities.cpp" />
+    <ClCompile Include="WindowsUtilities.cpp" />
   </ItemGroup>
 
   <ItemGroup>
@@ -91,14 +99,6 @@
     <ClInclude Include="PathResolver.h" />
     <ClInclude Include="Utilities.h" />
     <ClInclude Include="WindowsUtilities.h" />
-    <None Include="DirectoryMap.cpp" />
-    <None Include="EncryptionUtilities.cpp" />
-    <None Include="FileOperation.cpp" />
-    <None Include="JsonUtils.cpp" />
-    <None Include="ObjectStore.cpp" />
-    <None Include="PathResolver.cpp" />
-    <None Include="Utilities.cpp" />
-    <None Include="WindowsUtilities.cpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
