@@ -86,9 +86,11 @@
     <ClInclude Include="DirectoryMap.h" />
     <ClInclude Include="FileOperation.h" />
     <ClInclude Include="ObjectStore.h" />
+    <ClInclude Include="PathResolver.h" />
     <None Include="DirectoryMap.cpp" />
     <None Include="FileOperation.cpp" />
     <None Include="ObjectStore.cpp" />
+    <None Include="PathResolver.cpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
