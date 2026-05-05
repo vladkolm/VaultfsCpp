@@ -2,6 +2,7 @@
 
 #include "EncryptionUtilities.h"
 #include "Utilities.h"
+#include "WindowsUtilities.h"
 
 NTSTATUS FileOperation::GetVolumeInfo(FSP_FILE_SYSTEM*, FSP_FSCTL_VOLUME_INFO* VolumeInfo)
 {
