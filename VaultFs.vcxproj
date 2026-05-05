@@ -84,7 +84,9 @@
   <ItemGroup>
     <ClInclude Include="Data.h" />
     <ClInclude Include="FileOperation.h" />
+    <ClInclude Include="ObjectStore.h" />
     <None Include="FileOperation.cpp" />
+    <None Include="ObjectStore.cpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
