@@ -81,5 +81,10 @@
     <ClCompile Include="main.cpp" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ClInclude Include="FileOperation.h" />
+    <None Include="FileOperation.cpp" />
+  </ItemGroup>
+
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
