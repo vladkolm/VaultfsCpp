@@ -1,5 +1,6 @@
 #include "DirectoryMap.h"
 
+#include "EncryptionUtilities.h"
 #include "JsonUtils.h"
 #include "Utilities.h"
 

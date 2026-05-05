@@ -1,5 +1,6 @@
 #include "ObjectStore.h"
 
+#include "EncryptionUtilities.h"
 #include "Utilities.h"
 
 #include <random>
